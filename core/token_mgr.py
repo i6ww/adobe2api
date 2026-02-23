@@ -14,6 +14,8 @@ DATA_FILE = CONFIG_DIR / "tokens.json"
 LEGACY_DATA_FILE = DATA_DIR / "tokens.json"
 
 class TokenManager:
+    ERROR_COOLDOWN_SECONDS = 180
+
     def __init__(self):
         self._lock = threading.Lock()
         self.tokens: List[Dict] = []
@@ -26,6 +28,16 @@ class TokenManager:
             if source.exists():
                 try:
                     self.tokens = json.loads(source.read_text(encoding="utf-8"))
+                    now_ts = time.time()
+                    for t in self.tokens:
+                        if not isinstance(t, dict):
+                            continue
+                        t.setdefault("id", uuid.uuid4().hex[:8])
+                        t.setdefault("value", "")
+                        t.setdefault("status", "active")
+                        t.setdefault("fails", 0)
+                        t.setdefault("added_at", now_ts)
+                        t.setdefault("error_until", 0)
                     if source == LEGACY_DATA_FILE and not DATA_FILE.exists():
                         DATA_FILE.write_text(json.dumps(self.tokens, indent=2), encoding="utf-8")
                 except Exception:
@@ -49,7 +61,8 @@ class TokenManager:
                 "value": value,
                 "status": "active",
                 "fails": 0,
-                "added_at": time.time()
+                "added_at": time.time(),
+                "error_until": 0,
             }
             self.tokens.append(new_token)
             self.save()
@@ -60,12 +73,21 @@ class TokenManager:
             self.tokens = [t for t in self.tokens if t["id"] != tid]
             self.save()
 
+    def get_by_id(self, tid: str) -> Optional[Dict]:
+        with self._lock:
+            for t in self.tokens:
+                if t.get("id") == tid:
+                    return dict(t)
+        return None
+
     def set_status(self, tid: str, status: str):
         with self._lock:
             for t in self.tokens:
                 if t["id"] == tid:
                     t["status"] = status
                     t["fails"] = 0 if status == "active" else t["fails"]
+                    if status == "active":
+                        t["error_until"] = 0
             self.save()
 
     def get_available(self) -> Optional[str]:
@@ -75,15 +97,20 @@ class TokenManager:
                 active.sort(key=lambda x: x["fails"])
                 return active[0]["value"]
 
-            # Auto-revive one recoverable token to avoid permanent 503
-            # caused by transient upstream failures.
-            recoverable = [t for t in self.tokens if t["status"] == "error"]
+            # Auto-revive one recoverable token after cooldown.
+            now_ts = time.time()
+            recoverable = [
+                t
+                for t in self.tokens
+                if t["status"] == "error" and float(t.get("error_until", 0) or 0) <= now_ts
+            ]
             if not recoverable:
                 return None
             recoverable.sort(key=lambda x: x["fails"])
             chosen = recoverable[0]
             chosen["status"] = "active"
             chosen["fails"] = max(0, int(chosen.get("fails", 0)) - 1)
+            chosen["error_until"] = 0
             self.save()
             return chosen["value"]
 
@@ -92,6 +119,15 @@ class TokenManager:
             for t in self.tokens:
                 if t["value"] == value:
                     t["status"] = "exhausted"
+                    t["error_until"] = 0
+            self.save()
+
+    def report_invalid(self, value: str):
+        with self._lock:
+            for t in self.tokens:
+                if t["value"] == value:
+                    t["status"] = "invalid"
+                    t["error_until"] = 0
             self.save()
 
     def report_error(self, value: str):
@@ -99,8 +135,8 @@ class TokenManager:
             for t in self.tokens:
                 if t["value"] == value:
                     t["fails"] += 1
-                    if t["fails"] >= 8:
-                        t["status"] = "error"
+                    t["status"] = "error"
+                    t["error_until"] = time.time() + self.ERROR_COOLDOWN_SECONDS
             self.save()
 
     def report_success(self, value: str):
@@ -110,6 +146,7 @@ class TokenManager:
                     t["fails"] = max(0, int(t.get("fails", 0)) - 1)
                     if t["status"] == "error":
                         t["status"] = "active"
+                        t["error_until"] = 0
             self.save()
 
     @staticmethod
@@ -153,6 +190,7 @@ class TokenManager:
                     "status": t["status"],
                     "fails": t["fails"],
                     "added_at": t["added_at"],
+                    "error_until": t.get("error_until", 0),
                     "expires_at": exp_ts,
                     "expires_at_text": exp_readable,
                     "remaining_seconds": remaining_seconds,

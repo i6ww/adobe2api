@@ -1160,6 +1160,11 @@ def delete_token(tid: str):
 def set_token_status(tid: str, status: str):
     if status not in ("active", "disabled"):
         raise HTTPException(status_code=400, detail="Invalid status")
+    token_info = token_manager.get_by_id(tid)
+    if not token_info:
+        raise HTTPException(status_code=404, detail="token not found")
+    if status == "active" and token_info.get("status") in {"exhausted", "invalid"}:
+        raise HTTPException(status_code=400, detail="exhausted/invalid token cannot be reactivated; replace with a fresh token")
     token_manager.set_status(tid, status)
     return {"status": "ok"}
 
@@ -1244,7 +1249,7 @@ def openai_generate(data: dict, request: Request):
         token_manager.report_exhausted(token)
         return JSONResponse(status_code=429, content={"error": {"message": "Token quota exhausted", "type": "rate_limit_error"}})
     except AuthError:
-        token_manager.report_error(token)
+        token_manager.report_invalid(token)
         return JSONResponse(status_code=401, content={"error": {"message": "Token invalid or expired", "type": "authentication_error"}})
     except UpstreamTemporaryError as exc:
         return JSONResponse(status_code=503, content={"error": {"message": str(exc), "type": "server_error"}})
@@ -1300,7 +1305,7 @@ def create_job(data: GenerateRequest, request: Request):
             token_manager.report_exhausted(token)
             store.update(job_id, status="failed", error="Token quota exhausted.")
         except AuthError as exc:
-            token_manager.report_error(token)
+            token_manager.report_invalid(token)
             store.update(job_id, status="failed", error="Token invalid or expired.")
         except UpstreamTemporaryError as exc:
             store.update(job_id, status="failed", error=str(exc))
@@ -1436,7 +1441,7 @@ def chat_completions(data: dict, request: Request):
         token_manager.report_exhausted(token)
         return JSONResponse(status_code=429, content={"error": {"message": "Token quota exhausted", "type": "rate_limit_error"}})
     except AuthError:
-        token_manager.report_error(token)
+        token_manager.report_invalid(token)
         return JSONResponse(status_code=401, content={"error": {"message": "Token invalid or expired", "type": "authentication_error"}})
     except UpstreamTemporaryError as exc:
         return JSONResponse(status_code=503, content={"error": {"message": str(exc), "type": "server_error"}})

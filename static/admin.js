@@ -25,6 +25,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const STATUS_MAP = {
     "active": "生效中",
     "exhausted": "额度耗尽",
+    "invalid": "已失效",
     "error": "请求异常",
     "disabled": "已禁用"
   };
@@ -71,10 +72,15 @@ document.addEventListener("DOMContentLoaded", () => {
 
       const statusClass = `status-${t.status.toLowerCase()}`;
       const isStatusActive = t.status === "active";
+      const isFrozen = t.status === "exhausted" || t.status === "invalid";
       const displayStatus = STATUS_MAP[t.status.toLowerCase()] || t.status;
       
       const d = new Date(t.added_at * 1000);
       const dateStr = d.toLocaleString();
+
+      const toggleBtn = isFrozen
+        ? `<button class="small" disabled title="额度耗尽或已失效 token 不可启用">不可启用</button>`
+        : `<button class="small" onclick="toggleToken('${t.id}', '${isStatusActive ? 'disabled' : 'active'}')">${isStatusActive ? '禁用' : '启用'}</button>`;
 
       tr.innerHTML = `
         <td style="color: #a8bfd8; font-size: 12px;" title="添加时间: ${dateStr}">${t.id}</td>
@@ -83,9 +89,7 @@ document.addEventListener("DOMContentLoaded", () => {
         <td style="color: ${t.fails > 0 ? '#ffb4bc' : '#a8bfd8'};">${t.fails}</td>
         <td style="font-size:12px; line-height:1.35;">${formatExpiry(t)}</td>
         <td class="action-btns">
-          <button class="small" onclick="toggleToken('${t.id}', '${isStatusActive ? 'disabled' : 'active'}')">
-            ${isStatusActive ? '禁用' : '启用'}
-          </button>
+          ${toggleBtn}
           <button class="danger" onclick="deleteToken('${t.id}')">删除</button>
         </td>
       `;
@@ -134,7 +138,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
   window.toggleToken = async (id, newStatus) => {
     try {
-      await fetch(`/api/v1/tokens/${id}/status?status=${newStatus}`, { method: "PUT" });
+      const res = await fetch(`/api/v1/tokens/${id}/status?status=${newStatus}`, { method: "PUT" });
+      if (!res.ok) {
+        const text = await res.text();
+        alert(`状态更新失败: ${text}`);
+        return;
+      }
       loadTokens();
     } catch (err) {
       alert("状态更新失败");
