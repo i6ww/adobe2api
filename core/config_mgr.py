@@ -8,6 +8,7 @@ CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LEGACY_CONFIG_FILE = DATA_DIR / "config.json"
 
+
 class ConfigManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -18,7 +19,13 @@ class ConfigManager:
             "proxy": "",
             "use_proxy": False,
             "generate_timeout": 300,
-            "refresh_interval_hours": 15
+            "refresh_interval_hours": 15,
+            "retry_enabled": True,
+            "retry_max_attempts": 3,
+            "retry_backoff_seconds": 1.0,
+            "retry_on_status_codes": [429, 451, 500, 502, 503, 504],
+            "retry_on_error_types": ["timeout", "connection", "proxy"],
+            "token_rotation_strategy": "round_robin",
         }
         self.load()
 
@@ -32,7 +39,9 @@ class ConfigManager:
                         if k in self.config:
                             self.config[k] = v
                     if source == LEGACY_CONFIG_FILE and not CONFIG_FILE.exists():
-                        CONFIG_FILE.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+                        CONFIG_FILE.write_text(
+                            json.dumps(self.config, indent=2), encoding="utf-8"
+                        )
                 except Exception:
                     pass
 
@@ -59,5 +68,6 @@ class ConfigManager:
                 if k in self.config:
                     self.config[k] = v
         self.save()
+
 
 config_manager = ConfigManager()

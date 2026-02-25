@@ -202,6 +202,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const confUseProxy = document.getElementById("confUseProxy");
   const confProxy = document.getElementById("confProxy");
   const confGenerateTimeout = document.getElementById("confGenerateTimeout");
+  const confRetryEnabled = document.getElementById("confRetryEnabled");
+  const confRetryMaxAttempts = document.getElementById("confRetryMaxAttempts");
+  const confRetryBackoffSeconds = document.getElementById("confRetryBackoffSeconds");
+  const confRetryOnStatusCodes = document.getElementById("confRetryOnStatusCodes");
+  const confRetryOnErrorTypes = document.getElementById("confRetryOnErrorTypes");
+  const confTokenRotationStrategy = document.getElementById("confTokenRotationStrategy");
   const confRefreshIntervalHours = document.getElementById("confRefreshIntervalHours");
   const saveConfigBtn = document.getElementById("saveConfigBtn");
   const configMsg = document.getElementById("configMsg");
@@ -219,6 +225,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const logsTbody = document.querySelector("#logsTable tbody");
   const refreshLogsBtn = document.getElementById("refreshLogsBtn");
   const clearLogsBtn = document.getElementById("clearLogsBtn");
+  const logStatsRange = document.getElementById("logStatsRange");
+  const logStatsUpdatedAt = document.getElementById("logStatsUpdatedAt");
+  const logsStatsImageCount = document.getElementById("logsStatsImageCount");
+  const logsStatsVideoCount = document.getElementById("logsStatsVideoCount");
+  const logsStatsTotalCount = document.getElementById("logsStatsTotalCount");
+  const logsStatsFailCount = document.getElementById("logsStatsFailCount");
   const previewModal = document.getElementById("previewModal");
   const previewContent = document.getElementById("previewContent");
   const previewCloseBtn = document.getElementById("previewCloseBtn");
@@ -233,6 +245,16 @@ document.addEventListener("DOMContentLoaded", () => {
         confUseProxy.checked = data.use_proxy || false;
         confProxy.value = data.proxy || "";
         confGenerateTimeout.value = Number(data.generate_timeout || 300);
+        confRetryEnabled.checked = Boolean(data.retry_enabled ?? true);
+        confRetryMaxAttempts.value = Number(data.retry_max_attempts || 3);
+        confRetryBackoffSeconds.value = Number(data.retry_backoff_seconds ?? 1.0);
+        confRetryOnStatusCodes.value = Array.isArray(data.retry_on_status_codes)
+          ? data.retry_on_status_codes.join(",")
+          : "429,451,500,502,503,504";
+        confRetryOnErrorTypes.value = Array.isArray(data.retry_on_error_types)
+          ? data.retry_on_error_types.join(",")
+          : "timeout,connection,proxy";
+        confTokenRotationStrategy.value = String(data.token_rotation_strategy || "round_robin");
         confRefreshIntervalHours.value = Number(data.refresh_interval_hours || 15);
       }
     } catch (err) {
@@ -253,11 +275,32 @@ document.addEventListener("DOMContentLoaded", () => {
         use_proxy: confUseProxy.checked,
         proxy: confProxy.value.trim(),
         generate_timeout: Math.max(1, Number(confGenerateTimeout.value || 300)),
+        retry_enabled: confRetryEnabled.checked,
+        retry_max_attempts: Math.max(1, Math.min(10, Number(confRetryMaxAttempts.value || 3))),
+        retry_backoff_seconds: Math.max(0, Math.min(30, Number(confRetryBackoffSeconds.value || 1))),
+        retry_on_status_codes: String(confRetryOnStatusCodes.value || "")
+          .split(",")
+          .map(s => Number(String(s).trim()))
+          .filter(n => Number.isInteger(n) && n >= 100 && n <= 599),
+        retry_on_error_types: String(confRetryOnErrorTypes.value || "")
+          .split(",")
+          .map(s => String(s).trim().toLowerCase())
+          .filter(Boolean),
+        token_rotation_strategy: String(confTokenRotationStrategy.value || "round_robin").trim() || "round_robin",
         refresh_interval_hours: Number(confRefreshIntervalHours.value || 15),
       };
 
       if (!Number.isInteger(payload.refresh_interval_hours) || payload.refresh_interval_hours < 1 || payload.refresh_interval_hours > 24) {
         throw new Error("自动刷新间隔必须是 1-24 的整数小时");
+      }
+      if (!Number.isInteger(payload.retry_max_attempts) || payload.retry_max_attempts < 1 || payload.retry_max_attempts > 10) {
+        throw new Error("最大尝试次数必须是 1-10 的整数");
+      }
+      if (!Number.isFinite(payload.retry_backoff_seconds) || payload.retry_backoff_seconds < 0 || payload.retry_backoff_seconds > 30) {
+        throw new Error("重试退避基数必须是 0-30 的数字");
+      }
+      if (!["round_robin", "random"].includes(payload.token_rotation_strategy)) {
+        throw new Error("Token 轮换策略无效");
       }
 
       const res = await fetch("/api/v1/config", {
@@ -425,13 +468,52 @@ document.addEventListener("DOMContentLoaded", () => {
   async function loadLogs() {
     if (!logsTbody) return;
     try {
-      const res = await fetch("/api/v1/logs?limit=200");
-      if (!res.ok) throw new Error("加载日志失败");
-      const data = await res.json();
-      renderLogs(data.logs || []);
+      const rangeValue = logStatsRange ? String(logStatsRange.value || "today") : "today";
+      const [logsResult, statsResult] = await Promise.allSettled([
+        fetch("/api/v1/logs?limit=200"),
+        fetch(`/api/v1/logs/stats?range=${encodeURIComponent(rangeValue)}`),
+      ]);
+
+      if (logsResult.status !== "fulfilled" || !logsResult.value.ok) {
+        throw new Error("加载日志失败");
+      }
+
+      const logsData = await logsResult.value.json();
+      renderLogs(logsData.logs || []);
+
+      if (statsResult.status === "fulfilled" && statsResult.value.ok) {
+        const statsData = await statsResult.value.json();
+        renderLogStats(statsData);
+      } else {
+        renderLogStats(null);
+      }
     } catch (err) {
       logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state" style="color: #ffb4bc;">${err.message || "日志加载失败"}</td></tr>`;
+      renderLogStats(null);
     }
+  }
+
+  function renderLogStats(stats) {
+    const imageCount = Number(stats?.generated_images || 0);
+    const videoCount = Number(stats?.generated_videos || 0);
+    const totalCount = Number(stats?.total_requests || 0);
+    const failCount = Number(stats?.failed_requests || 0);
+
+    if (logsStatsImageCount) logsStatsImageCount.textContent = String(imageCount);
+    if (logsStatsVideoCount) logsStatsVideoCount.textContent = String(videoCount);
+    if (logsStatsTotalCount) logsStatsTotalCount.textContent = String(totalCount);
+    if (logsStatsFailCount) logsStatsFailCount.textContent = String(failCount);
+
+    if (!logStatsUpdatedAt) return;
+    if (!stats) {
+      logStatsUpdatedAt.textContent = "统计信息暂不可用";
+      return;
+    }
+
+    const selectedLabel = logStatsRange?.selectedOptions?.[0]?.textContent || "当前范围";
+    const endTs = Number(stats.end_ts || 0);
+    const updatedText = endTs > 0 ? new Date(endTs * 1000).toLocaleString() : "-";
+    logStatsUpdatedAt.textContent = `${selectedLabel}统计，更新于 ${updatedText}`;
   }
 
   function renderLogs(logs) {
@@ -559,6 +641,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (refreshLogsBtn) {
     refreshLogsBtn.addEventListener("click", loadLogs);
+  }
+
+  if (logStatsRange) {
+    logStatsRange.addEventListener("change", loadLogs);
   }
 
   if (clearLogsBtn) {

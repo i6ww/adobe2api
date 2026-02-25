@@ -94,6 +94,43 @@
           </div>
 
           <div class="form-group">
+            <label class="checkbox-label" style="user-select: none;">
+              <input type="checkbox" id="confRetryEnabled" />
+              启用自动重试
+            </label>
+            <p class="help">当命中可重试错误时，自动切换到下一个 token 重试。</p>
+          </div>
+
+          <div class="form-group">
+            <label for="confRetryMaxAttempts">最大尝试次数 (含首次)</label>
+            <input type="number" id="confRetryMaxAttempts" class="input-text" min="1" max="10" step="1" placeholder="默认 3" />
+          </div>
+
+          <div class="form-group">
+            <label for="confRetryBackoffSeconds">重试退避基数 (秒)</label>
+            <input type="number" id="confRetryBackoffSeconds" class="input-text" min="0" max="30" step="0.1" placeholder="默认 1.0" />
+            <p class="help">第 n 次重试等待时间 = 基数 * 2^(n-1)。</p>
+          </div>
+
+          <div class="form-group">
+            <label for="confRetryOnStatusCodes">可重试状态码</label>
+            <input type="text" id="confRetryOnStatusCodes" class="input-text" placeholder="例如：429,451,500,502,503,504" />
+          </div>
+
+          <div class="form-group">
+            <label for="confRetryOnErrorTypes">可重试错误类型</label>
+            <input type="text" id="confRetryOnErrorTypes" class="input-text" placeholder="例如：timeout,connection,proxy" />
+          </div>
+
+          <div class="form-group">
+            <label for="confTokenRotationStrategy">Token 轮换策略</label>
+            <select id="confTokenRotationStrategy" class="input-select">
+              <option value="round_robin">round_robin（始终轮换）</option>
+              <option value="random">random（随机轮换）</option>
+            </select>
+          </div>
+
+          <div class="form-group">
             <label for="confRefreshIntervalHours">自动刷新间隔 (小时)</label>
             <input type="number" id="confRefreshIntervalHours" class="input-text" min="1" max="24" step="1" placeholder="默认 15" />
             <p class="help">范围 1-24 小时。后台将严格按该间隔刷新。</p>
@@ -113,11 +150,36 @@
         <div class="list-head">
           <h2>请求日志</h2>
           <div class="actions">
+            <label for="logStatsRange" class="help">统计范围</label>
+            <select id="logStatsRange" class="input-select" aria-label="日志统计范围">
+              <option value="today">今日</option>
+              <option value="7d">近 7 天</option>
+              <option value="30d">近 30 天</option>
+            </select>
             <button id="refreshLogsBtn" class="secondary">刷新</button>
             <button id="clearLogsBtn" class="danger">清空日志</button>
           </div>
         </div>
         <p class="help" style="margin-bottom: 16px;">仅展示外部 OpenAI 风格请求日志，便于排查真实生图请求。</p>
+        <div class="stats-grid" id="logsStatsGrid">
+          <div class="stat-card">
+            <div class="stat-label">图片生成数</div>
+            <div id="logsStatsImageCount" class="stat-value">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">视频生成数</div>
+            <div id="logsStatsVideoCount" class="stat-value">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">请求总数</div>
+            <div id="logsStatsTotalCount" class="stat-value">-</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">失败请求数</div>
+            <div id="logsStatsFailCount" class="stat-value">-</div>
+          </div>
+        </div>
+        <p id="logStatsUpdatedAt" class="help" style="margin: 0 0 16px 0;"></p>
         <div class="table-wrapper">
           <table id="logsTable">
             <thead>

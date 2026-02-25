@@ -3,6 +3,7 @@ import base64
 import threading
 import time
 import uuid
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -13,12 +14,14 @@ CONFIG_DIR = BASE_DIR / "config"
 DATA_FILE = CONFIG_DIR / "tokens.json"
 LEGACY_DATA_FILE = DATA_DIR / "tokens.json"
 
+
 class TokenManager:
     ERROR_COOLDOWN_SECONDS = 180
 
     def __init__(self):
         self._lock = threading.Lock()
         self.tokens: List[Dict] = []
+        self._rr_index = 0
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         self.load()
 
@@ -39,7 +42,9 @@ class TokenManager:
                         t.setdefault("added_at", now_ts)
                         t.setdefault("error_until", 0)
                     if source == LEGACY_DATA_FILE and not DATA_FILE.exists():
-                        DATA_FILE.write_text(json.dumps(self.tokens, indent=2), encoding="utf-8")
+                        DATA_FILE.write_text(
+                            json.dumps(self.tokens, indent=2), encoding="utf-8"
+                        )
                 except Exception:
                     self.tokens = []
 
@@ -52,14 +57,14 @@ class TokenManager:
             if value.startswith("Bearer "):
                 value = value[7:].strip()
             meta = dict(meta or {})
-                
+
             for t in self.tokens:
                 if t["value"] == value:
                     if meta:
                         t.update(meta)
                         self.save()
                     return t
-            
+
             new_token = {
                 "id": uuid.uuid4().hex[:8],
                 "value": value,
@@ -132,19 +137,36 @@ class TokenManager:
                         t["error_until"] = 0
             self.save()
 
-    def get_available(self) -> Optional[str]:
+    def _pick_active_token_locked(
+        self, strategy: str = "round_robin"
+    ) -> Optional[Dict]:
+        active = [t for t in self.tokens if t["status"] == "active"]
+        if not active:
+            return None
+
+        chosen = None
+        mode = str(strategy or "round_robin").strip().lower()
+        if mode == "random":
+            chosen = random.choice(active)
+        else:
+            idx = self._rr_index % len(active)
+            chosen = active[idx]
+            self._rr_index = (idx + 1) % len(active)
+        return chosen
+
+    def get_available(self, strategy: str = "round_robin") -> Optional[str]:
         with self._lock:
-            active = [t for t in self.tokens if t["status"] == "active"]
-            if active:
-                active.sort(key=lambda x: x["fails"])
-                return active[0]["value"]
+            chosen = self._pick_active_token_locked(strategy=strategy)
+            if chosen is not None:
+                return chosen["value"]
 
             # Auto-revive one recoverable token after cooldown.
             now_ts = time.time()
             recoverable = [
                 t
                 for t in self.tokens
-                if t["status"] == "error" and float(t.get("error_until", 0) or 0) <= now_ts
+                if t["status"] == "error"
+                and float(t.get("error_until", 0) or 0) <= now_ts
             ]
             if not recoverable:
                 return None
@@ -154,7 +176,8 @@ class TokenManager:
             chosen["fails"] = max(0, int(chosen.get("fails", 0)) - 1)
             chosen["error_until"] = 0
             self.save()
-            return chosen["value"]
+            picked = self._pick_active_token_locked(strategy=strategy)
+            return (picked or chosen)["value"]
 
     def report_exhausted(self, value: str):
         with self._lock:
@@ -252,23 +275,32 @@ class TokenManager:
                 if exp_ts is not None:
                     remaining_seconds = exp_ts - now_ts
                     try:
-                        exp_readable = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d %H:%M:%S")
+                        exp_readable = datetime.fromtimestamp(exp_ts).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
                     except Exception:
                         exp_readable = str(exp_ts)
-                res.append({
-                    "id": t["id"],
-                    "value": masked,
-                    "status": t["status"],
-                    "fails": t["fails"],
-                    "added_at": t["added_at"],
-                    "error_until": t.get("error_until", 0),
-                    "source": t.get("source", "manual"),
-                    "auto_refresh": bool(t.get("auto_refresh", False)),
-                    "expires_at": exp_ts,
-                    "expires_at_text": exp_readable,
-                    "remaining_seconds": remaining_seconds,
-                    "is_expired": bool(exp_ts is not None and remaining_seconds is not None and remaining_seconds <= 0),
-                })
+                res.append(
+                    {
+                        "id": t["id"],
+                        "value": masked,
+                        "status": t["status"],
+                        "fails": t["fails"],
+                        "added_at": t["added_at"],
+                        "error_until": t.get("error_until", 0),
+                        "source": t.get("source", "manual"),
+                        "auto_refresh": bool(t.get("auto_refresh", False)),
+                        "expires_at": exp_ts,
+                        "expires_at_text": exp_readable,
+                        "remaining_seconds": remaining_seconds,
+                        "is_expired": bool(
+                            exp_ts is not None
+                            and remaining_seconds is not None
+                            and remaining_seconds <= 0
+                        ),
+                    }
+                )
             return res
+
 
 token_manager = TokenManager()

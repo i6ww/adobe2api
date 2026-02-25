@@ -314,6 +314,49 @@ button.small:hover {
   margin: 0;
 }
 
+.input-select {
+  min-width: 120px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+}
+
+.input-select:focus {
+  outline: none;
+  border-color: var(--brand);
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.stat-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 12px;
+}
+
+.stat-label {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.stat-value {
+  color: #e7f1fd;
+  font-size: 24px;
+  line-height: 1.1;
+  font-weight: 700;
+}
+
 .table-wrapper {
   overflow-x: auto;
 }
@@ -445,4 +488,32 @@ td {
 
 .preview-download:hover {
   background: rgba(255, 255, 255, 0.2);
+}
+
+@media (max-width: 900px) {
+  .stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .list-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .list-head .actions {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+}
+
+@media (max-width: 560px) {
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .input-select {
+    width: 100%;
+  }
 }

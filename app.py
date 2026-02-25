@@ -7,6 +7,7 @@ import uuid
 import base64
 import binascii
 import io
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, List, Any, Callable
@@ -126,7 +127,15 @@ class AuthError(AdobeRequestError):
 
 
 class UpstreamTemporaryError(AdobeRequestError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        error_type: str = "",
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = str(error_type or "").strip().lower()
 
 
 class AdobeClient:
@@ -139,6 +148,12 @@ class AdobeClient:
         self.impersonate = "chrome124"
         self.proxy = ""
         self.generate_timeout = 300
+        self.retry_enabled = True
+        self.retry_max_attempts = 3
+        self.retry_backoff_seconds = 1.0
+        self.retry_on_status_codes = [429, 451, 500, 502, 503, 504]
+        self.retry_on_error_types = {"timeout", "connection", "proxy"}
+        self.token_rotation_strategy = "round_robin"
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         self.sec_ch_ua = (
             '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
@@ -182,10 +197,105 @@ class AdobeClient:
             timeout_val = 300
         self.generate_timeout = timeout_val if timeout_val > 0 else 300
         self.proxy = proxy if use_proxy and proxy else ""
+        self.retry_enabled = bool(cfg.get("retry_enabled", True))
+        try:
+            attempts = int(cfg.get("retry_max_attempts", 3))
+        except Exception:
+            attempts = 3
+        self.retry_max_attempts = max(1, min(attempts, 10))
+
+        try:
+            backoff = float(cfg.get("retry_backoff_seconds", 1.0))
+        except Exception:
+            backoff = 1.0
+        self.retry_backoff_seconds = max(0.0, min(backoff, 30.0))
+
+        status_codes_raw = cfg.get(
+            "retry_on_status_codes", [429, 451, 500, 502, 503, 504]
+        )
+        parsed_status_codes: list[int] = []
+        if isinstance(status_codes_raw, list):
+            for item in status_codes_raw:
+                try:
+                    val = int(item)
+                except Exception:
+                    continue
+                if 100 <= val <= 599:
+                    parsed_status_codes.append(val)
+        self.retry_on_status_codes = sorted(set(parsed_status_codes)) or [
+            429,
+            451,
+            500,
+            502,
+            503,
+            504,
+        ]
+
+        error_types_raw = cfg.get(
+            "retry_on_error_types", ["timeout", "connection", "proxy"]
+        )
+        parsed_error_types: set[str] = set()
+        if isinstance(error_types_raw, list):
+            for item in error_types_raw:
+                txt = str(item or "").strip().lower()
+                if txt:
+                    parsed_error_types.add(txt)
+        self.retry_on_error_types = parsed_error_types or {
+            "timeout",
+            "connection",
+            "proxy",
+        }
+
+        strategy = (
+            str(cfg.get("token_rotation_strategy", "round_robin") or "round_robin")
+            .strip()
+            .lower()
+        )
+        if strategy not in {"round_robin", "random"}:
+            strategy = "round_robin"
+        self.token_rotation_strategy = strategy
         if self.proxy:
             logger.warning("proxy enabled for upstream requests: %s", self.proxy)
         else:
             logger.warning("proxy disabled for upstream requests")
+
+    def _retry_delay_for_attempt(self, attempt: int) -> float:
+        base = float(self.retry_backoff_seconds or 0.0)
+        if base <= 0:
+            return 0.0
+        safe_attempt = max(1, int(attempt))
+        return min(30.0, base * (2 ** (safe_attempt - 1)))
+
+    def should_retry_temporary_error(self, exc: UpstreamTemporaryError) -> bool:
+        if not self.retry_enabled:
+            return False
+        if isinstance(exc, UpstreamTemporaryError):
+            if exc.status_code is not None:
+                try:
+                    return int(exc.status_code) in set(self.retry_on_status_codes)
+                except Exception:
+                    return False
+            if exc.error_type:
+                return exc.error_type in set(self.retry_on_error_types)
+        return False
+
+    @staticmethod
+    def _classify_network_error_type(exc: Exception) -> str:
+        text = str(exc or "").strip().lower()
+        if "timed out" in text or "timeout" in text:
+            return "timeout"
+        if "proxy" in text:
+            return "proxy"
+        if (
+            "connection" in text
+            or "dns" in text
+            or "resolve" in text
+            or "refused" in text
+            or "reset" in text
+            or "unreachable" in text
+        ):
+            return "connection"
+        return "network"
 
     def _requests_proxies(self) -> Optional[dict]:
         if not self.proxy:
@@ -195,7 +305,7 @@ class AdobeClient:
     def _session(self):
         if CurlSession is None:
             return None
-        kwargs = {"impersonate": self.impersonate, "timeout": 20}
+        kwargs = {"impersonate": self.impersonate, "timeout": 60}
         if self.proxy:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         return CurlSession(**kwargs)
@@ -249,49 +359,142 @@ class AdobeClient:
     def _post_json(self, url: str, headers: dict, payload: dict):
         session = self._session()
         if session is None:
-            return requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=20,
-                proxies=self._requests_proxies(),
+            try:
+                return requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=60,
+                    proxies=self._requests_proxies(),
+                )
+            except requests.Timeout as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream timeout: {exc}", error_type="timeout"
+                )
+            except requests.ProxyError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream proxy error: {exc}", error_type="proxy"
+                )
+            except requests.ConnectionError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream connection error: {exc}", error_type="connection"
+                )
+            except requests.RequestException as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream request error: {exc}", error_type="network"
+                )
+        try:
+            with session:
+                resp = session.post(url, headers=headers, json=payload)
+        except Exception as exc:
+            raise UpstreamTemporaryError(
+                f"upstream session error: {exc}",
+                error_type=self._classify_network_error_type(exc),
             )
-        with session:
-            resp = session.post(url, headers=headers, json=payload)
         # Some environments return intermittent 451 via curl_cffi path.
         # Retry once with plain requests for better stability.
         if resp.status_code == 451:
-            return requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=20,
-                proxies=self._requests_proxies(),
-            )
+            try:
+                return requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=60,
+                    proxies=self._requests_proxies(),
+                )
+            except requests.Timeout as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream timeout: {exc}", status_code=451, error_type="timeout"
+                )
+            except requests.ProxyError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream proxy error: {exc}", status_code=451, error_type="proxy"
+                )
+            except requests.ConnectionError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream connection error: {exc}",
+                    status_code=451,
+                    error_type="connection",
+                )
+            except requests.RequestException as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream request error: {exc}",
+                    status_code=451,
+                    error_type="network",
+                )
         return resp
 
     def _post_bytes(self, url: str, headers: dict, payload: bytes):
         session = self._session()
         if session is None:
-            return requests.post(
-                url,
-                headers=headers,
-                data=payload,
-                timeout=30,
-                proxies=self._requests_proxies(),
+            try:
+                return requests.post(
+                    url,
+                    headers=headers,
+                    data=payload,
+                    timeout=60,
+                    proxies=self._requests_proxies(),
+                )
+            except requests.Timeout as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream timeout: {exc}", error_type="timeout"
+                )
+            except requests.ProxyError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream proxy error: {exc}", error_type="proxy"
+                )
+            except requests.ConnectionError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream connection error: {exc}", error_type="connection"
+                )
+            except requests.RequestException as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream request error: {exc}", error_type="network"
+                )
+        try:
+            with session:
+                resp = session.post(url, headers=headers, data=payload)
+        except Exception as exc:
+            raise UpstreamTemporaryError(
+                f"upstream session error: {exc}",
+                error_type=self._classify_network_error_type(exc),
             )
-        with session:
-            resp = session.post(url, headers=headers, data=payload)
         return resp
 
-    def _get(self, url: str, headers: dict, timeout: int = 20):
+    def _get(self, url: str, headers: dict, timeout: int = 60):
         session = self._session()
         if session is None:
-            return requests.get(
-                url, headers=headers, timeout=timeout, proxies=self._requests_proxies()
+            try:
+                return requests.get(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    proxies=self._requests_proxies(),
+                )
+            except requests.Timeout as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream timeout: {exc}", error_type="timeout"
+                )
+            except requests.ProxyError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream proxy error: {exc}", error_type="proxy"
+                )
+            except requests.ConnectionError as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream connection error: {exc}", error_type="connection"
+                )
+            except requests.RequestException as exc:
+                raise UpstreamTemporaryError(
+                    f"upstream request error: {exc}", error_type="network"
+                )
+        try:
+            with session:
+                resp = session.get(url, headers=headers)
+        except Exception as exc:
+            raise UpstreamTemporaryError(
+                f"upstream session error: {exc}",
+                error_type=self._classify_network_error_type(exc),
             )
-        with session:
-            resp = session.get(url, headers=headers)
         return resp
 
     @staticmethod
@@ -340,6 +543,12 @@ class AdobeClient:
         if resp.status_code in (401, 403):
             raise AuthError("Token invalid or expired")
         if resp.status_code != 200:
+            if resp.status_code in (429, 451) or resp.status_code >= 500:
+                raise UpstreamTemporaryError(
+                    f"upload image failed: {resp.status_code} {resp.text[:300]}",
+                    status_code=resp.status_code,
+                    error_type="status",
+                )
             raise AdobeRequestError(
                 f"upload image failed: {resp.status_code} {resp.text[:300]}"
             )
@@ -414,6 +623,95 @@ class AdobeClient:
         if aspect_ratio == "16:9":
             return {"width": 1280, "height": 720}
         return {"width": 720, "height": 1280}
+
+    @staticmethod
+    def _coerce_progress_percent(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+
+        val: Optional[float] = None
+        if isinstance(value, (int, float)):
+            val = float(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.endswith("%"):
+                text = text[:-1].strip()
+            try:
+                val = float(text)
+            except Exception:
+                return None
+        elif isinstance(value, dict):
+            for key in (
+                "progress",
+                "percentage",
+                "percent",
+                "task_progress",
+                "taskProgress",
+                "value",
+            ):
+                nested = AdobeClient._coerce_progress_percent(value.get(key))
+                if nested is not None:
+                    return nested
+            return None
+        else:
+            return None
+
+        if val <= 1.0:
+            val = val * 100.0
+        if val < 0:
+            return 0.0
+        if val > 100:
+            return 100.0
+        return val
+
+    @staticmethod
+    def _is_in_progress_status(status_val: str) -> bool:
+        return str(status_val or "").upper() in {
+            "IN_PROGRESS",
+            "RUNNING",
+            "PROCESSING",
+            "PENDING",
+            "QUEUED",
+            "STARTED",
+        }
+
+    def _extract_progress_percent(self, latest: dict, poll_resp) -> Optional[float]:
+        if not isinstance(latest, dict):
+            latest = {}
+
+        task_obj = latest.get("task") if isinstance(latest.get("task"), dict) else {}
+        result_obj = (
+            latest.get("result") if isinstance(latest.get("result"), dict) else {}
+        )
+        meta_obj = latest.get("meta") if isinstance(latest.get("meta"), dict) else {}
+        metadata_obj = (
+            latest.get("metadata") if isinstance(latest.get("metadata"), dict) else {}
+        )
+
+        candidates: list[Any] = [
+            latest.get("progress"),
+            latest.get("percentage"),
+            latest.get("percent"),
+            latest.get("task_progress"),
+            latest.get("taskProgress"),
+            task_obj.get("progress"),
+            task_obj.get("percentage"),
+            result_obj.get("progress"),
+            result_obj.get("percentage"),
+            meta_obj.get("progress"),
+            metadata_obj.get("progress"),
+            poll_resp.headers.get("x-task-progress"),
+            poll_resp.headers.get("x-progress"),
+            poll_resp.headers.get("progress"),
+        ]
+
+        for raw in candidates:
+            parsed = self._coerce_progress_percent(raw)
+            if parsed is not None:
+                return parsed
+        return None
 
     @staticmethod
     def _normalize_video_poll_url(raw_url: str) -> str:
@@ -591,7 +889,9 @@ class AdobeClient:
         if submit_resp.status_code != 200:
             if submit_resp.status_code in (429, 451) or submit_resp.status_code >= 500:
                 raise UpstreamTemporaryError(
-                    f"video submit failed: {submit_resp.status_code} {submit_resp.text[:300]}"
+                    f"video submit failed: {submit_resp.status_code} {submit_resp.text[:300]}",
+                    status_code=submit_resp.status_code,
+                    error_type="status",
                 )
             raise AdobeRequestError(
                 f"video submit failed: {submit_resp.status_code} {submit_resp.text[:300]}"
@@ -622,14 +922,16 @@ class AdobeClient:
         start = time.time()
         while True:
             poll_resp = self._get(
-                poll_url, headers=self._poll_headers(token), timeout=20
+                poll_url, headers=self._poll_headers(token), timeout=60
             )
             if poll_resp.status_code in (401, 403):
                 raise AuthError("Token invalid or expired")
             if poll_resp.status_code != 200:
                 if poll_resp.status_code in (429, 451) or poll_resp.status_code >= 500:
                     raise UpstreamTemporaryError(
-                        f"video poll failed: {poll_resp.status_code} {poll_resp.text[:300]}"
+                        f"video poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
+                        status_code=poll_resp.status_code,
+                        error_type="status",
                     )
                 raise AdobeRequestError(
                     f"video poll failed: {poll_resp.status_code} {poll_resp.text[:300]}"
@@ -638,17 +940,9 @@ class AdobeClient:
             latest = poll_resp.json()
             status_header = str(poll_resp.headers.get("x-task-status") or "").upper()
             status_val = str(latest.get("status") or "").upper() or status_header
-            progress_raw = latest.get("progress")
-            progress_val = None
-            try:
-                if progress_raw is not None:
-                    progress_val = float(progress_raw)
-                    if progress_val <= 1.0:
-                        progress_val = progress_val * 100.0
-            except Exception:
-                progress_val = None
+            progress_val = self._extract_progress_percent(latest, poll_resp)
 
-            if progress_cb and status_val == "IN_PROGRESS":
+            if progress_cb and self._is_in_progress_status(status_val):
                 try:
                     progress_cb(
                         {
@@ -778,7 +1072,9 @@ class AdobeClient:
             )
             if submit_resp.status_code in (429, 451) or submit_resp.status_code >= 500:
                 raise UpstreamTemporaryError(
-                    f"submit failed: {submit_resp.status_code} {submit_resp.text[:300]}"
+                    f"submit failed: {submit_resp.status_code} {submit_resp.text[:300]}",
+                    status_code=submit_resp.status_code,
+                    error_type="status",
                 )
             if last_error:
                 raise AdobeRequestError(
@@ -816,7 +1112,7 @@ class AdobeClient:
         sleep_time = 3.0
         while True:
             poll_resp = self._get(
-                poll_url, headers=self._poll_headers(token), timeout=20
+                poll_url, headers=self._poll_headers(token), timeout=60
             )
             if poll_resp.status_code != 200:
                 logger.error(
@@ -824,6 +1120,12 @@ class AdobeClient:
                     poll_resp.status_code,
                     poll_resp.text[:500],
                 )
+                if poll_resp.status_code in (429, 451) or poll_resp.status_code >= 500:
+                    raise UpstreamTemporaryError(
+                        f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}",
+                        status_code=poll_resp.status_code,
+                        error_type="status",
+                    )
                 raise AdobeRequestError(
                     f"poll failed: {poll_resp.status_code} {poll_resp.text[:300]}"
                 )
@@ -831,17 +1133,9 @@ class AdobeClient:
             latest = poll_resp.json()
             status_header = str(poll_resp.headers.get("x-task-status") or "").upper()
             status_val = str(latest.get("status") or "").upper() or status_header
-            progress_raw = latest.get("progress")
-            progress_val = None
-            try:
-                if progress_raw is not None:
-                    progress_val = float(progress_raw)
-                    if progress_val <= 1.0:
-                        progress_val = progress_val * 100.0
-            except Exception:
-                progress_val = None
+            progress_val = self._extract_progress_percent(latest, poll_resp)
 
-            if progress_cb and status_val == "IN_PROGRESS":
+            if progress_cb and self._is_in_progress_status(status_val):
                 try:
                     progress_cb(
                         {
@@ -1072,6 +1366,70 @@ class RequestLogStore:
                 continue
         return data
 
+    def stats(
+        self,
+        start_ts: Optional[float] = None,
+        end_ts: Optional[float] = None,
+    ) -> dict:
+        with self._lock:
+            with self._file_path.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+        total_requests = 0
+        failed_requests = 0
+        generated_images = 0
+        generated_videos = 0
+        in_progress_requests = 0
+
+        for line in lines:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                ts_val = float(item.get("ts") or 0)
+            except Exception:
+                ts_val = 0.0
+            if start_ts is not None and ts_val < float(start_ts):
+                continue
+            if end_ts is not None and ts_val > float(end_ts):
+                continue
+
+            total_requests += 1
+
+            try:
+                status_code = int(item.get("status_code") or 0)
+            except Exception:
+                status_code = 0
+            if status_code >= 400:
+                failed_requests += 1
+
+            task_status = str(item.get("task_status") or "").upper()
+            if task_status == "IN_PROGRESS":
+                in_progress_requests += 1
+
+            preview_kind = str(item.get("preview_kind") or "").strip().lower()
+            if 200 <= status_code < 300:
+                if preview_kind == "image":
+                    generated_images += 1
+                elif preview_kind == "video":
+                    generated_videos += 1
+
+        return {
+            "total_requests": total_requests,
+            "failed_requests": failed_requests,
+            "generated_images": generated_images,
+            "generated_videos": generated_videos,
+            "generated_total": generated_images + generated_videos,
+            "in_progress_requests": in_progress_requests,
+        }
+
     def clear(self) -> None:
         with self._lock:
             with self._file_path.open("w", encoding="utf-8") as f:
@@ -1089,7 +1447,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/generated", StaticFiles(directory=GENERATED_DIR), name="generated_files")
 
 store = JobStore()
-log_store = RequestLogStore(DATA_DIR / "request_logs.jsonl")
+log_store = RequestLogStore(DATA_DIR / "request_logs.jsonl", max_items=5000)
 client = AdobeClient()
 refresh_manager.start()
 
@@ -1283,6 +1641,12 @@ class ConfigUpdateRequest(BaseModel):
     use_proxy: Optional[bool] = None
     generate_timeout: Optional[int] = None
     refresh_interval_hours: Optional[int] = None
+    retry_enabled: Optional[bool] = None
+    retry_max_attempts: Optional[int] = None
+    retry_backoff_seconds: Optional[float] = None
+    retry_on_status_codes: Optional[List[int]] = None
+    retry_on_error_types: Optional[List[str]] = None
+    token_rotation_strategy: Optional[str] = None
 
 
 class RefreshBundleImportRequest(BaseModel):
@@ -1318,6 +1682,71 @@ def _resolve_video_options(data: dict) -> tuple[bool, str]:
         data.get("negative_prompt") or data.get("negativePrompt") or ""
     ).strip()
     return generate_audio, negative_prompt
+
+
+def _run_with_token_retries(
+    request: Request,
+    operation_name: str,
+    run_once: Callable[[str], Any],
+) -> Any:
+    max_attempts = client.retry_max_attempts if client.retry_enabled else 1
+    max_attempts = max(1, int(max_attempts))
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        token = token_manager.get_available(strategy=client.token_rotation_strategy)
+        if not token:
+            break
+
+        try:
+            return run_once(token)
+        except QuotaExhaustedError as exc:
+            token_manager.report_exhausted(token)
+            last_exc = exc
+            retryable = attempt < max_attempts
+            retry_reason = "quota_exhausted"
+        except AuthError as exc:
+            token_manager.report_invalid(token)
+            last_exc = exc
+            retryable = attempt < max_attempts
+            retry_reason = "auth"
+        except UpstreamTemporaryError as exc:
+            last_exc = exc
+            retryable = attempt < max_attempts and client.should_retry_temporary_error(
+                exc
+            )
+            status_part = f"status={exc.status_code}" if exc.status_code else "status=?"
+            type_part = f"type={exc.error_type or 'temporary'}"
+            retry_reason = f"upstream_temporary {status_part} {type_part}"
+        except Exception:
+            raise
+
+        if retryable:
+            delay = client._retry_delay_for_attempt(attempt)
+            logger.warning(
+                "retrying operation=%s attempt=%s/%s reason=%s delay=%.2fs strategy=%s",
+                operation_name,
+                attempt,
+                max_attempts,
+                retry_reason,
+                delay,
+                client.token_rotation_strategy,
+            )
+            _set_request_task_progress(
+                request,
+                task_status="IN_PROGRESS",
+                error=f"retry {attempt}/{max_attempts}: {retry_reason}",
+            )
+            if delay > 0:
+                time.sleep(delay)
+            continue
+        break
+
+    if last_exc is not None:
+        raise last_exc
+    raise HTTPException(
+        status_code=503, detail="No active tokens available in the pool"
+    )
 
 
 def _extract_prompt_from_messages(messages) -> str:
@@ -1604,6 +2033,31 @@ def list_logs(limit: int = 100):
     return {"logs": log_store.list(limit=limit)}
 
 
+def _resolve_logs_stats_range(range_key: str) -> tuple[str, float, float]:
+    now_dt = datetime.now()
+    now_ts = time.time()
+    key = str(range_key or "today").strip().lower()
+    if key == "today":
+        start_dt = datetime(now_dt.year, now_dt.month, now_dt.day)
+    elif key == "7d":
+        start_dt = now_dt - timedelta(days=7)
+    elif key == "30d":
+        start_dt = now_dt - timedelta(days=30)
+    else:
+        raise HTTPException(
+            status_code=400, detail="range must be one of: today, 7d, 30d"
+        )
+    return key, start_dt.timestamp(), now_ts
+
+
+@app.get("/api/v1/logs/stats")
+def logs_stats(range: str = "today"):
+    range_key, start_ts, end_ts = _resolve_logs_stats_range(range)
+    payload = log_store.stats(start_ts=start_ts, end_ts=end_ts)
+    payload.update({"range": range_key, "start_ts": start_ts, "end_ts": end_ts})
+    return payload
+
+
 @app.delete("/api/v1/logs")
 def clear_logs():
     log_store.clear()
@@ -1716,6 +2170,77 @@ def update_config(req: ConfigUpdateRequest):
                 detail="refresh_interval_hours must be between 1 and 24",
             )
         update_data["refresh_interval_hours"] = interval_hours
+    if "retry_enabled" in incoming:
+        update_data["retry_enabled"] = bool(incoming["retry_enabled"])
+    if "retry_max_attempts" in incoming:
+        try:
+            retry_max_attempts = int(incoming["retry_max_attempts"])
+        except Exception:
+            raise HTTPException(
+                status_code=400, detail="retry_max_attempts must be an integer"
+            )
+        if retry_max_attempts < 1 or retry_max_attempts > 10:
+            raise HTTPException(
+                status_code=400,
+                detail="retry_max_attempts must be between 1 and 10",
+            )
+        update_data["retry_max_attempts"] = retry_max_attempts
+    if "retry_backoff_seconds" in incoming:
+        try:
+            retry_backoff_seconds = float(incoming["retry_backoff_seconds"])
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="retry_backoff_seconds must be a number",
+            )
+        if retry_backoff_seconds < 0 or retry_backoff_seconds > 30:
+            raise HTTPException(
+                status_code=400,
+                detail="retry_backoff_seconds must be between 0 and 30",
+            )
+        update_data["retry_backoff_seconds"] = retry_backoff_seconds
+    if "retry_on_status_codes" in incoming:
+        raw_codes = incoming["retry_on_status_codes"] or []
+        if not isinstance(raw_codes, list):
+            raise HTTPException(
+                status_code=400, detail="retry_on_status_codes must be a list"
+            )
+        status_codes: list[int] = []
+        for item in raw_codes:
+            try:
+                code = int(item)
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="retry_on_status_codes contains invalid value",
+                )
+            if code < 100 or code > 599:
+                raise HTTPException(
+                    status_code=400,
+                    detail="retry_on_status_codes must be HTTP status codes",
+                )
+            status_codes.append(code)
+        update_data["retry_on_status_codes"] = sorted(set(status_codes))
+    if "retry_on_error_types" in incoming:
+        raw_types = incoming["retry_on_error_types"] or []
+        if not isinstance(raw_types, list):
+            raise HTTPException(
+                status_code=400, detail="retry_on_error_types must be a list"
+            )
+        error_types: list[str] = []
+        for item in raw_types:
+            txt = str(item or "").strip().lower()
+            if txt:
+                error_types.append(txt)
+        update_data["retry_on_error_types"] = sorted(set(error_types))
+    if "token_rotation_strategy" in incoming:
+        strategy = str(incoming["token_rotation_strategy"] or "").strip().lower()
+        if strategy not in {"round_robin", "random"}:
+            raise HTTPException(
+                status_code=400,
+                detail="token_rotation_strategy must be one of: round_robin, random",
+            )
+        update_data["token_rotation_strategy"] = strategy
     config_manager.update_all(update_data)
     client.apply_config(config_manager.get_all())
     return config_manager.get_all()
@@ -1788,55 +2313,47 @@ def openai_generate(data: dict, request: Request):
         data, model_id
     )
 
-    token = token_manager.get_available()
-    if not token:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": {
-                    "message": "No active tokens available in the pool",
-                    "type": "server_error",
-                }
-            },
-        )
-
     try:
         _set_request_task_progress(
             request, task_status="IN_PROGRESS", task_progress=0.0
         )
 
-        def _image_progress_cb(update: dict):
-            _set_request_task_progress(
-                request,
-                task_status=str(update.get("task_status") or "IN_PROGRESS"),
-                task_progress=update.get("task_progress"),
-                upstream_job_id=update.get("upstream_job_id"),
-                retry_after=update.get("retry_after"),
-                error=update.get("error"),
+        def _run_once(token: str):
+            def _image_progress_cb(update: dict):
+                _set_request_task_progress(
+                    request,
+                    task_status=str(update.get("task_status") or "IN_PROGRESS"),
+                    task_progress=update.get("task_progress"),
+                    upstream_job_id=update.get("upstream_job_id"),
+                    retry_after=update.get("retry_after"),
+                    error=update.get("error"),
+                )
+
+            image_bytes, _meta = client.generate(
+                token=token,
+                prompt=prompt,
+                aspect_ratio=ratio,
+                output_resolution=output_resolution,
+                timeout=client.generate_timeout,
+                progress_cb=_image_progress_cb,
             )
 
-        image_bytes, meta = client.generate(
-            token=token,
-            prompt=prompt,
-            aspect_ratio=ratio,
-            output_resolution=output_resolution,
-            timeout=client.generate_timeout,
-            progress_cb=_image_progress_cb,
+            job_id = uuid.uuid4().hex
+            out_path = GENERATED_DIR / f"{job_id}.png"
+            out_path.write_bytes(image_bytes)
+            image_url = _public_image_url(request, job_id)
+            _set_request_preview(request, image_url, kind="image")
+            return {
+                "created": int(time.time()),
+                "model": resolved_model_id,
+                "data": [{"url": image_url}],
+            }
+
+        return _run_with_token_retries(
+            request=request,
+            operation_name="images.generations",
+            run_once=_run_once,
         )
-
-        # 保存图片以便通过URL返回
-        job_id = uuid.uuid4().hex
-        out_path = GENERATED_DIR / f"{job_id}.png"
-        out_path.write_bytes(image_bytes)
-
-        image_url = _public_image_url(request, job_id)
-        _set_request_preview(request, image_url, kind="image")
-
-        return {
-            "created": int(time.time()),
-            "model": resolved_model_id,
-            "data": [{"url": image_url}],
-        }
 
     except QuotaExhaustedError:
         _set_request_task_progress(
@@ -1845,7 +2362,6 @@ def openai_generate(data: dict, request: Request):
             task_progress=0.0,
             error="Token quota exhausted",
         )
-        token_manager.report_exhausted(token)
         return JSONResponse(
             status_code=429,
             content={
@@ -1862,7 +2378,6 @@ def openai_generate(data: dict, request: Request):
             task_progress=0.0,
             error="Token invalid or expired",
         )
-        token_manager.report_invalid(token)
         return JSONResponse(
             status_code=401,
             content={
@@ -1879,6 +2394,19 @@ def openai_generate(data: dict, request: Request):
         return JSONResponse(
             status_code=503,
             content={"error": {"message": str(exc), "type": "server_error"}},
+        )
+    except HTTPException as exc:
+        _set_request_task_progress(
+            request, task_status="FAILED", task_progress=0.0, error=str(exc.detail)
+        )
+        err_type = (
+            "invalid_request_error"
+            if 400 <= int(exc.status_code) < 500
+            else "server_error"
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"message": str(exc.detail), "type": err_type}},
         )
     except Exception as exc:
         logger.exception(
@@ -1922,41 +2450,58 @@ def create_job(data: GenerateRequest, request: Request):
 
     def runner(job_id: str):
         store.update(job_id, status="running", progress=5.0)
+        max_attempts = client.retry_max_attempts if client.retry_enabled else 1
+        max_attempts = max(1, int(max_attempts))
+        last_error = "No active tokens available in the pool"
 
-        token = token_manager.get_available()
-        if not token:
-            store.update(
-                job_id, status="failed", error="No active tokens available in the pool"
-            )
-            return
+        for attempt in range(1, max_attempts + 1):
+            token = token_manager.get_available(strategy=client.token_rotation_strategy)
+            if not token:
+                break
 
-        try:
-            image_bytes, meta = client.generate(
-                token=token,
-                prompt=prompt,
-                aspect_ratio=ratio,
-                output_resolution=output_resolution,
-            )
-            out_path = GENERATED_DIR / f"{job_id}.png"
-            out_path.write_bytes(image_bytes)
-            progress = float(meta.get("progress") or 100.0)
-            image_url = f"{base_url}/generated/{job_id}.png"
-            store.update(
-                job_id,
-                status="succeeded",
-                progress=max(progress, 100.0),
-                image_url=image_url,
-            )
-        except QuotaExhaustedError as exc:
-            token_manager.report_exhausted(token)
-            store.update(job_id, status="failed", error="Token quota exhausted.")
-        except AuthError as exc:
-            token_manager.report_invalid(token)
-            store.update(job_id, status="failed", error="Token invalid or expired.")
-        except UpstreamTemporaryError as exc:
-            store.update(job_id, status="failed", error=str(exc))
-        except Exception as exc:
-            store.update(job_id, status="failed", error=str(exc))
+            try:
+                image_bytes, meta = client.generate(
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=ratio,
+                    output_resolution=output_resolution,
+                )
+                out_path = GENERATED_DIR / f"{job_id}.png"
+                out_path.write_bytes(image_bytes)
+                progress = float(meta.get("progress") or 100.0)
+                image_url = f"{base_url}/generated/{job_id}.png"
+                store.update(
+                    job_id,
+                    status="succeeded",
+                    progress=max(progress, 100.0),
+                    image_url=image_url,
+                )
+                return
+            except QuotaExhaustedError:
+                token_manager.report_exhausted(token)
+                last_error = "Token quota exhausted."
+                retryable = attempt < max_attempts
+            except AuthError:
+                token_manager.report_invalid(token)
+                last_error = "Token invalid or expired."
+                retryable = attempt < max_attempts
+            except UpstreamTemporaryError as exc:
+                last_error = str(exc)
+                retryable = (
+                    attempt < max_attempts and client.should_retry_temporary_error(exc)
+                )
+            except Exception as exc:
+                store.update(job_id, status="failed", error=str(exc))
+                return
+
+            if retryable:
+                delay = client._retry_delay_for_attempt(attempt)
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+            break
+
+        store.update(job_id, status="failed", error=last_error)
 
     threading.Thread(target=runner, args=(job.id,), daemon=True).start()
 
@@ -2026,137 +2571,129 @@ def chat_completions(data: dict, request: Request):
             data, model_id or None
         )
 
-    token = token_manager.get_available()
-    if not token:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": {
-                    "message": "No active tokens available in the pool",
-                    "type": "server_error",
-                }
-            },
-        )
-
     try:
         input_images = _load_input_images(data.get("messages") or [])
-        source_image_ids: list[str] = []
-        image_url = ""
-        response_label = "generated image"
+        _set_request_task_progress(
+            request, task_status="IN_PROGRESS", task_progress=0.0
+        )
 
-        if is_video_model:
-            max_video_inputs = 2 if video_engine == "veo31-fast" else 1
-            if len(input_images) > max_video_inputs:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": {
-                            "message": f"video model supports at most {max_video_inputs} input image(s)",
-                            "type": "invalid_request_error",
-                        }
-                    },
+        def _run_once(token: str):
+            source_image_ids: list[str] = []
+            image_url = ""
+            response_label = "generated image"
+
+            if is_video_model:
+                max_video_inputs = 2 if video_engine == "veo31-fast" else 1
+                if len(input_images) > max_video_inputs:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"video model supports at most {max_video_inputs} input image(s)",
+                    )
+                for image_bytes, _image_mime in input_images[:max_video_inputs]:
+                    prepared_bytes, prepared_mime = _prepare_video_source_image(
+                        image_bytes,
+                        ratio,
+                        video_resolution,
+                    )
+                    source_image_ids.append(
+                        client.upload_image(token, prepared_bytes, prepared_mime)
+                    )
+
+                def _video_progress_cb(update: dict):
+                    _set_request_task_progress(
+                        request,
+                        task_status=str(update.get("task_status") or "IN_PROGRESS"),
+                        task_progress=update.get("task_progress"),
+                        upstream_job_id=update.get("upstream_job_id"),
+                        retry_after=update.get("retry_after"),
+                        error=update.get("error"),
+                    )
+
+                video_bytes, video_meta = client.generate_video(
+                    token=token,
+                    video_conf=video_conf or {},
+                    prompt=prompt,
+                    aspect_ratio=ratio,
+                    duration=duration,
+                    source_image_ids=source_image_ids,
+                    timeout=max(int(client.generate_timeout), 600),
+                    negative_prompt=negative_prompt,
+                    generate_audio=generate_audio,
+                    progress_cb=_video_progress_cb,
                 )
-            for image_bytes, _image_mime in input_images[:max_video_inputs]:
-                prepared_bytes, prepared_mime = _prepare_video_source_image(
-                    image_bytes,
-                    ratio,
-                    video_resolution,
+                job_id = uuid.uuid4().hex
+                video_ext = _video_ext_from_meta(video_meta)
+                filename = f"{job_id}.{video_ext}"
+                out_path = GENERATED_DIR / filename
+                out_path.write_bytes(video_bytes)
+                image_url = _public_generated_url(request, filename)
+                _set_request_preview(request, image_url, kind="video")
+                response_label = "generated video"
+            else:
+                for image_bytes, image_mime in input_images:
+                    source_image_ids.append(
+                        client.upload_image(
+                            token, image_bytes, image_mime or "image/jpeg"
+                        )
+                    )
+
+                def _image_progress_cb(update: dict):
+                    _set_request_task_progress(
+                        request,
+                        task_status=str(update.get("task_status") or "IN_PROGRESS"),
+                        task_progress=update.get("task_progress"),
+                        upstream_job_id=update.get("upstream_job_id"),
+                        retry_after=update.get("retry_after"),
+                        error=update.get("error"),
+                    )
+
+                image_bytes, _meta = client.generate(
+                    token=token,
+                    prompt=prompt,
+                    aspect_ratio=ratio,
+                    output_resolution=output_resolution,
+                    source_image_ids=source_image_ids,
+                    timeout=client.generate_timeout,
+                    progress_cb=_image_progress_cb,
                 )
-                source_image_ids.append(
-                    client.upload_image(token, prepared_bytes, prepared_mime)
+                job_id = uuid.uuid4().hex
+                out_path = GENERATED_DIR / f"{job_id}.png"
+                out_path.write_bytes(image_bytes)
+                image_url = _public_image_url(request, job_id)
+                _set_request_preview(request, image_url, kind="image")
+
+            response_payload = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": resolved_model_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": f"![{response_label}]({image_url})\n\n{image_url}",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if bool(data.get("stream", False)):
+                return StreamingResponse(
+                    _sse_chat_stream(response_payload), media_type="text/event-stream"
                 )
+            return response_payload
 
-            _set_request_task_progress(
-                request, task_status="IN_PROGRESS", task_progress=0.0
-            )
-
-            def _video_progress_cb(update: dict):
-                _set_request_task_progress(
-                    request,
-                    task_status=str(update.get("task_status") or "IN_PROGRESS"),
-                    task_progress=update.get("task_progress"),
-                    upstream_job_id=update.get("upstream_job_id"),
-                    retry_after=update.get("retry_after"),
-                    error=update.get("error"),
-                )
-
-            video_bytes, video_meta = client.generate_video(
-                token=token,
-                video_conf=video_conf or {},
-                prompt=prompt,
-                aspect_ratio=ratio,
-                duration=duration,
-                source_image_ids=source_image_ids,
-                timeout=max(int(client.generate_timeout), 600),
-                negative_prompt=negative_prompt,
-                generate_audio=generate_audio,
-                progress_cb=_video_progress_cb,
-            )
-            job_id = uuid.uuid4().hex
-            video_ext = _video_ext_from_meta(video_meta)
-            filename = f"{job_id}.{video_ext}"
-            out_path = GENERATED_DIR / filename
-            out_path.write_bytes(video_bytes)
-            image_url = _public_generated_url(request, filename)
-            _set_request_preview(request, image_url, kind="video")
-            response_label = "generated video"
-        else:
-            for image_bytes, image_mime in input_images:
-                source_image_ids.append(
-                    client.upload_image(token, image_bytes, image_mime or "image/jpeg")
-                )
-
-            _set_request_task_progress(
-                request, task_status="IN_PROGRESS", task_progress=0.0
-            )
-
-            def _image_progress_cb(update: dict):
-                _set_request_task_progress(
-                    request,
-                    task_status=str(update.get("task_status") or "IN_PROGRESS"),
-                    task_progress=update.get("task_progress"),
-                    upstream_job_id=update.get("upstream_job_id"),
-                    retry_after=update.get("retry_after"),
-                    error=update.get("error"),
-                )
-
-            image_bytes, _meta = client.generate(
-                token=token,
-                prompt=prompt,
-                aspect_ratio=ratio,
-                output_resolution=output_resolution,
-                source_image_ids=source_image_ids,
-                timeout=client.generate_timeout,
-                progress_cb=_image_progress_cb,
-            )
-            job_id = uuid.uuid4().hex
-            out_path = GENERATED_DIR / f"{job_id}.png"
-            out_path.write_bytes(image_bytes)
-            image_url = _public_image_url(request, job_id)
-            _set_request_preview(request, image_url, kind="image")
-
-        response_payload = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": resolved_model_id,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": f"![{response_label}]({image_url})\n\n{image_url}",
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        }
-        if bool(data.get("stream", False)):
-            return StreamingResponse(
-                _sse_chat_stream(response_payload), media_type="text/event-stream"
-            )
-        return response_payload
+        return _run_with_token_retries(
+            request=request,
+            operation_name="chat.completions",
+            run_once=_run_once,
+        )
     except QuotaExhaustedError:
         _set_request_task_progress(
             request,
@@ -2164,7 +2701,6 @@ def chat_completions(data: dict, request: Request):
             task_progress=0.0,
             error="Token quota exhausted",
         )
-        token_manager.report_exhausted(token)
         return JSONResponse(
             status_code=429,
             content={
@@ -2181,7 +2717,6 @@ def chat_completions(data: dict, request: Request):
             task_progress=0.0,
             error="Token invalid or expired",
         )
-        token_manager.report_invalid(token)
         return JSONResponse(
             status_code=401,
             content={
@@ -2198,6 +2733,19 @@ def chat_completions(data: dict, request: Request):
         return JSONResponse(
             status_code=503,
             content={"error": {"message": str(exc), "type": "server_error"}},
+        )
+    except HTTPException as exc:
+        _set_request_task_progress(
+            request, task_status="FAILED", task_progress=0.0, error=str(exc.detail)
+        )
+        err_type = (
+            "invalid_request_error"
+            if 400 <= int(exc.status_code) < 500
+            else "server_error"
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"message": str(exc.detail), "type": err_type}},
         )
     except Exception as exc:
         logger.exception(
