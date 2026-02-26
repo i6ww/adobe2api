@@ -549,6 +549,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Config Management
   const confApiKey = document.getElementById("confApiKey");
+  const confPublicBaseUrl = document.getElementById("confPublicBaseUrl");
   const confUseProxy = document.getElementById("confUseProxy");
   const confProxy = document.getElementById("confProxy");
   const confGenerateTimeout = document.getElementById("confGenerateTimeout");
@@ -628,6 +629,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (res.ok) {
         const data = await res.json();
         confApiKey.value = data.api_key || "";
+        confPublicBaseUrl.value = data.public_base_url || "";
         confUseProxy.checked = data.use_proxy || false;
         confProxy.value = data.proxy || "";
         confGenerateTimeout.value = Number(data.generate_timeout || 300);
@@ -658,6 +660,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const payload = {
         ...currentData,
         api_key: confApiKey.value.trim(),
+        public_base_url: confPublicBaseUrl.value.trim(),
         use_proxy: confUseProxy.checked,
         proxy: confProxy.value.trim(),
         generate_timeout: Math.max(1, Number(confGenerateTimeout.value || 300)),

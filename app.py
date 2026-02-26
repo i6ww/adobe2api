@@ -1744,6 +1744,7 @@ class TokenCreditsBatchRefreshRequest(BaseModel):
 
 class ConfigUpdateRequest(BaseModel):
     api_key: Optional[str] = None
+    public_base_url: Optional[str] = None
     proxy: Optional[str] = None
     use_proxy: Optional[bool] = None
     generate_timeout: Optional[int] = None
@@ -2167,6 +2168,10 @@ def _public_generated_url(request: Request, filename: str) -> str:
     safe_name = str(filename or "").lstrip("/")
     path = f"/generated/{safe_name}"
 
+    config_base = str(config_manager.get("public_base_url", "") or "").strip()
+    if config_base:
+        return f"{config_base.rstrip('/')}{path}"
+
     override = str(
         os.getenv("ADOBE_PUBLIC_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or ""
     ).strip()
@@ -2178,11 +2183,13 @@ def _public_generated_url(request: Request, filename: str) -> str:
         forwarded_proto = str(
             request.headers.get("x-forwarded-proto") or "http"
         ).strip()
-        return f"{forwarded_proto}://{forwarded_host}{path}"
+        forwarded_prefix = str(request.headers.get("x-forwarded-prefix") or "").strip()
+        if forwarded_prefix and not forwarded_prefix.startswith("/"):
+            forwarded_prefix = f"/{forwarded_prefix}"
+        forwarded_prefix = forwarded_prefix.rstrip("/")
+        return f"{forwarded_proto}://{forwarded_host}{forwarded_prefix}{path}"
 
-    # Prefer relative URLs so Docker/Reverse Proxy deployments remain reachable
-    # even when request host resolution is internal.
-    return path
+    return f"{str(request.base_url).rstrip('/')}{path}"
 
 
 def _video_ext_from_meta(meta: dict) -> str:
@@ -2496,6 +2503,8 @@ def update_config(req: ConfigUpdateRequest):
     update_data = {}
     if "api_key" in incoming:
         update_data["api_key"] = str(incoming["api_key"] or "").strip()
+    if "public_base_url" in incoming:
+        update_data["public_base_url"] = str(incoming["public_base_url"] or "").strip()
     if "proxy" in incoming:
         update_data["proxy"] = str(incoming["proxy"] or "").strip()
     if "use_proxy" in incoming:

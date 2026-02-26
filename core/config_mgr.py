@@ -16,6 +16,7 @@ class ConfigManager:
         # Default config
         self.config = {
             "api_key": "clio-playground-web",
+            "public_base_url": "http://127.0.0.1:6001/",
             "proxy": "",
             "use_proxy": False,
             "generate_timeout": 300,
