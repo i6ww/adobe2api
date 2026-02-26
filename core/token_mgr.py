@@ -401,5 +401,31 @@ class TokenManager:
                 )
             return res
 
+    def export_tokens(self, ids: Optional[List[str]] = None) -> List[Dict]:
+        selected_ids = None
+        if isinstance(ids, list):
+            normalized = [str(x or "").strip() for x in ids]
+            selected_ids = {x for x in normalized if x}
+        with self._lock:
+            out: List[Dict] = []
+            for t in self.tokens:
+                tid = str(t.get("id") or "").strip()
+                if selected_ids is not None and tid not in selected_ids:
+                    continue
+                out.append(
+                    {
+                        "id": tid,
+                        "token": str(t.get("value") or "").strip(),
+                        "status": str(t.get("status") or "active"),
+                        "source": str(t.get("source") or "manual"),
+                        "auto_refresh": bool(t.get("auto_refresh", False)),
+                        "refresh_profile_id": t.get("refresh_profile_id"),
+                        "refresh_profile_name": t.get("refresh_profile_name"),
+                        "refresh_profile_email": t.get("refresh_profile_email"),
+                        "added_at": t.get("added_at"),
+                    }
+                )
+            return out
+
 
 token_manager = TokenManager()

@@ -32,6 +32,8 @@
         <div class="actions">
           <button id="openAddTokenModalBtn">添加 Token</button>
           <button id="openRefreshModalBtn" class="secondary">导入 Refresh Bundle</button>
+          <button id="exportTokensBtn" class="secondary">导出 Token</button>
+          <button id="exportBundlesBtn" class="secondary">导出 Refresh Bundle</button>
         </div>
       </section>
 
@@ -47,6 +49,7 @@
           <table id="tokenTable">
             <thead>
               <tr>
+                <th><input id="tokenSelectAll" type="checkbox" title="全选/取消全选" /></th>
                 <th>账号</th>
                 <th>Token (脱敏展示)</th>
                 <th>状态</th>
@@ -59,7 +62,7 @@
             </thead>
             <tbody>
               <tr>
-                <td colspan="8" class="empty-state">加载中...</td>
+                <td colspan="9" class="empty-state">加载中...</td>
               </tr>
             </tbody>
           </table>
@@ -190,12 +193,11 @@
               <tr>
                 <th>时间</th>
                 <th>状态</th>
-                <th>耗时(秒)</th>
+                <th>耗时/秒</th>
                 <th>进度</th>
-                <th>Token账号</th>
+                <th>账号</th>
                 <th>模型</th>
                 <th>提示词摘要</th>
-                <th>使用代理</th>
                 <th>预览</th>
               </tr>
             </thead>
@@ -205,6 +207,11 @@
               </tr>
             </tbody>
           </table>
+        </div>
+        <div id="logsPagination" class="logs-pagination">
+          <button id="logsPrevBtn" class="secondary small" type="button">上一页</button>
+          <span id="logsPageInfo" class="help">第 1 / 1 页</span>
+          <button id="logsNextBtn" class="secondary small" type="button">下一页</button>
         </div>
       </section>
     </div>
@@ -219,6 +226,11 @@
       </div>
       <div class="add-form">
         <textarea id="tokenInput" placeholder="支持批量添加：一行一个 Token（例如\neyJhbGciOiJSUz...\neyJhbGciOiJSUz...）"></textarea>
+        <div class="form-group" style="margin-top: 10px;">
+          <label for="tokenFile">或上传 Token 文件（支持多选）</label>
+          <input type="file" id="tokenFile" accept="text/plain,.txt,application/json,.json" multiple />
+          <p class="help">支持 .txt（每行一个 token）或 .json（数组/对象）。</p>
+        </div>
         <div class="actions">
           <button id="addBtn">确认添加</button>
           <span id="addMsg" class="msg"></span>

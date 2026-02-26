@@ -223,6 +223,49 @@ class RefreshManager:
         items.sort(key=lambda x: int(x.get("imported_at") or 0), reverse=True)
         return items
 
+    def export_bundles(self, ids: Optional[List[str]] = None) -> List[Dict]:
+        selected_ids = None
+        if isinstance(ids, list):
+            normalized = [str(x or "").strip() for x in ids]
+            selected_ids = {x for x in normalized if x}
+        with self._lock:
+            out: List[Dict] = []
+            for p in self._profiles:
+                pid = str(p.get("id") or "").strip()
+                if selected_ids is not None and pid not in selected_ids:
+                    continue
+                endpoint = (
+                    p.get("endpoint") if isinstance(p.get("endpoint"), dict) else {}
+                )
+                form = (
+                    endpoint.get("form")
+                    if isinstance(endpoint.get("form"), dict)
+                    else {}
+                )
+                headers = (
+                    endpoint.get("headers")
+                    if isinstance(endpoint.get("headers"), dict)
+                    else {}
+                )
+                bundle = {
+                    "endpoint": {
+                        "url": str(endpoint.get("url") or "").strip(),
+                        "method": str(endpoint.get("method") or "POST").strip()
+                        or "POST",
+                        "form": dict(form),
+                        "headers": dict(headers),
+                    }
+                }
+                out.append(
+                    {
+                        "id": pid,
+                        "name": str(p.get("name") or "").strip(),
+                        "enabled": bool(p.get("enabled", True)),
+                        "bundle": bundle,
+                    }
+                )
+            return out
+
     def is_profile_enabled(self, profile_id: str) -> Optional[bool]:
         pid = str(profile_id or "").strip()
         if not pid:

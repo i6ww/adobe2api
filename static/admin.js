@@ -16,6 +16,7 @@ document.addEventListener("DOMContentLoaded", () => {
       btn.classList.add("active");
       document.getElementById(btn.dataset.target).classList.add("active");
       if (btn.dataset.target === "logs") {
+        logsCurrentPage = 1;
         loadLogs();
       } else if (logsAutoTimer) {
         clearTimeout(logsAutoTimer);
@@ -26,17 +27,24 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Token Management
   const tokenInput = document.getElementById("tokenInput");
+  const tokenFile = document.getElementById("tokenFile");
   const addBtn = document.getElementById("addBtn");
   const addMsg = document.getElementById("addMsg");
   const openAddTokenModalBtn = document.getElementById("openAddTokenModalBtn");
   const tokenModal = document.getElementById("tokenModal");
   const tokenModalCloseBtn = document.getElementById("tokenModalCloseBtn");
   const openRefreshModalBtn = document.getElementById("openRefreshModalBtn");
+  const exportTokensBtn = document.getElementById("exportTokensBtn");
+  const exportBundlesBtn = document.getElementById("exportBundlesBtn");
   const refreshModal = document.getElementById("refreshModal");
   const refreshModalCloseBtn = document.getElementById("refreshModalCloseBtn");
   const refreshBtn = document.getElementById("refreshBtn");
   const refreshCreditsBatchBtn = document.getElementById("refreshCreditsBatchBtn");
+  const tokenSelectAll = document.getElementById("tokenSelectAll");
   const tbody = document.querySelector("#tokenTable tbody");
+  const tokenSelectedIds = new Set();
+  let logsAutoTimer = null;
+  let latestTokens = [];
 
   const STATUS_MAP = {
     "active": "生效中",
@@ -53,8 +61,17 @@ document.addEventListener("DOMContentLoaded", () => {
       renderTable(data.tokens || []);
     } catch (err) {
       console.error(err);
-      tbody.innerHTML = `<tr><td colspan="8" class="empty-state" style="color: #ffb4bc;">加载失败</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: #ffb4bc;">加载失败</td></tr>`;
     }
+  }
+
+  function syncTokenSelectAllState() {
+    if (!tokenSelectAll) return;
+    const tokenIds = latestTokens.map((t) => String(t.id || "")).filter(Boolean);
+    const selectedCount = tokenIds.filter((id) => tokenSelectedIds.has(id)).length;
+    const total = tokenIds.length;
+    tokenSelectAll.indeterminate = selectedCount > 0 && selectedCount < total;
+    tokenSelectAll.checked = total > 0 && selectedCount === total;
   }
 
   function openDialog(modalEl) {
@@ -106,14 +123,23 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function renderTable(tokens) {
+    latestTokens = Array.isArray(tokens) ? tokens : [];
+    const availableIds = new Set(latestTokens.map((t) => String(t.id || "")).filter(Boolean));
+    Array.from(tokenSelectedIds).forEach((id) => {
+      if (!availableIds.has(id)) tokenSelectedIds.delete(id);
+    });
+
     if (!tokens.length) {
-      tbody.innerHTML = `<tr><td colspan="8" class="empty-state">当前没有可用的 Token，请在上方添加。</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="empty-state">当前没有可用的 Token，请在上方添加。</td></tr>`;
+      syncTokenSelectAllState();
       return;
     }
 
     tbody.innerHTML = "";
     tokens.forEach(t => {
       const tr = document.createElement("tr");
+      const tokenId = String(t.id || "").trim();
+      const selectedAttr = tokenSelectedIds.has(tokenId) ? "checked" : "";
 
       const statusClass = `status-${t.status.toLowerCase()}`;
       const isStatusActive = t.status === "active";
@@ -149,6 +175,7 @@ document.addEventListener("DOMContentLoaded", () => {
       `;
 
       tr.innerHTML = `
+        <td><input type="checkbox" class="token-select" data-id="${tokenId}" ${selectedAttr} /></td>
         <td style="color: #a8bfd8; font-size: 12px;" title="添加时间: ${dateStr}">${accountName}<br>${accountEmail}</td>
         <td class="token-val">${t.value}</td>
         <td><span class="status-badge ${statusClass}">${displayStatus}</span></td>
@@ -160,17 +187,20 @@ document.addEventListener("DOMContentLoaded", () => {
       `;
       tbody.appendChild(tr);
     });
+    syncTokenSelectAllState();
   }
 
   addBtn.addEventListener("click", async () => {
-    const raw = String(tokenInput.value || "");
-    const tokens = raw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    let tokens = [];
+    try {
+      tokens = await collectTokensFromInputs();
+    } catch (err) {
+      showMsg(addMsg, err.message || "文件解析失败", true);
+      return;
+    }
 
     if (!tokens.length) {
-      showMsg(addMsg, "请先输入 Token 内容", true);
+      showMsg(addMsg, "请先输入 Token 内容或上传文件", true);
       return;
     }
 
@@ -185,6 +215,7 @@ document.addEventListener("DOMContentLoaded", () => {
       });
       if (res.ok) {
         tokenInput.value = "";
+        if (tokenFile) tokenFile.value = "";
         if (tokens.length > 1) {
           const data = await res.json();
           const addedCount = Number(data?.added_count || 0);
@@ -211,6 +242,37 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   refreshBtn.addEventListener("click", loadTokens);
+
+  if (tokenSelectAll) {
+    tokenSelectAll.addEventListener("change", () => {
+      const checked = Boolean(tokenSelectAll.checked);
+      if (checked) {
+        latestTokens.forEach((t) => {
+          const tid = String(t.id || "").trim();
+          if (tid) tokenSelectedIds.add(tid);
+        });
+      } else {
+        tokenSelectedIds.clear();
+      }
+      tbody.querySelectorAll("input.token-select").forEach((el) => {
+        el.checked = checked;
+      });
+      syncTokenSelectAllState();
+    });
+  }
+
+  if (tbody) {
+    tbody.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement)) return;
+      if (!target.classList.contains("token-select")) return;
+      const tid = String(target.dataset.id || "").trim();
+      if (!tid) return;
+      if (target.checked) tokenSelectedIds.add(tid);
+      else tokenSelectedIds.delete(tid);
+      syncTokenSelectAllState();
+    });
+  }
 
   if (openAddTokenModalBtn) {
     openAddTokenModalBtn.addEventListener("click", () => openDialog(tokenModal));
@@ -361,6 +423,79 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  if (exportTokensBtn) {
+    exportTokensBtn.addEventListener("click", async () => {
+      exportTokensBtn.disabled = true;
+      try {
+        const selectedIds = Array.from(tokenSelectedIds);
+        const payload = selectedIds.length ? { ids: selectedIds } : { ids: null };
+        const res = await fetch("/api/v1/tokens/export", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(txt || "导出 Token 失败");
+        }
+        const data = await res.json();
+        const total = Number(data.total || 0);
+        if (total <= 0) {
+          alert("没有可导出的 Token");
+          return;
+        }
+        downloadJsonFile(`tokens-export-${nowStamp()}.json`, data);
+        alert(`导出成功：${total} 个 Token`);
+      } catch (err) {
+        alert(err.message || "导出 Token 失败");
+      } finally {
+        exportTokensBtn.disabled = false;
+      }
+    });
+  }
+
+  if (exportBundlesBtn) {
+    exportBundlesBtn.addEventListener("click", async () => {
+      exportBundlesBtn.disabled = true;
+      try {
+        const selectedIds = Array.from(refreshSelectedIds);
+        const payload = selectedIds.length ? { ids: selectedIds } : { ids: null };
+        const res = await fetch("/api/v1/refresh-profiles/export", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(txt || "导出 Refresh Bundle 失败");
+        }
+        const data = await res.json();
+        const total = Number(data.total || 0);
+        if (total <= 0) {
+          alert("没有可导出的 Refresh Bundle");
+          return;
+        }
+        const output = {
+          exported_at: Math.floor(Date.now() / 1000),
+          total,
+          items: Array.isArray(data.items)
+            ? data.items.map((it) => ({
+                id: it.id,
+                name: it.name,
+                bundle: it.bundle,
+              }))
+            : [],
+        };
+        downloadJsonFile(`refresh-bundles-export-${nowStamp()}.json`, output);
+        alert(`导出成功：${total} 个 Refresh Bundle`);
+      } catch (err) {
+        alert(err.message || "导出 Refresh Bundle 失败");
+      } finally {
+        exportBundlesBtn.disabled = false;
+      }
+    });
+  }
+
   // Config Management
   const confApiKey = document.getElementById("confApiKey");
   const confUseProxy = document.getElementById("confUseProxy");
@@ -381,8 +516,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const refreshProfiles = document.getElementById("refreshProfiles");
   const refreshMsg = document.getElementById("refreshMsg");
   let latestRefreshProfiles = [];
-  let logsAutoTimer = null;
-
+  const refreshSelectedIds = new Set();
   // Logs
   const logsTbody = document.querySelector("#logsTable tbody");
   const refreshLogsBtn = document.getElementById("refreshLogsBtn");
@@ -393,10 +527,46 @@ document.addEventListener("DOMContentLoaded", () => {
   const logsStatsVideoCount = document.getElementById("logsStatsVideoCount");
   const logsStatsTotalCount = document.getElementById("logsStatsTotalCount");
   const logsStatsFailCount = document.getElementById("logsStatsFailCount");
+  const logsPrevBtn = document.getElementById("logsPrevBtn");
+  const logsNextBtn = document.getElementById("logsNextBtn");
+  const logsPageInfo = document.getElementById("logsPageInfo");
   const previewModal = document.getElementById("previewModal");
   const previewContent = document.getElementById("previewContent");
   const previewCloseBtn = document.getElementById("previewCloseBtn");
   const previewDownloadBtn = document.getElementById("previewDownloadBtn");
+  const LOGS_PAGE_SIZE = 20;
+  let logsCurrentPage = 1;
+  let logsTotalPages = 1;
+
+  if (refreshProfiles) {
+    refreshProfiles.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLInputElement)) return;
+      if (target.id === "refreshSelectAll") {
+        const checked = Boolean(target.checked);
+        if (checked) {
+          latestRefreshProfiles.forEach((item) => {
+            const pid = String(item.id || "").trim();
+            if (pid) refreshSelectedIds.add(pid);
+          });
+        } else {
+          refreshSelectedIds.clear();
+        }
+        refreshProfiles.querySelectorAll("input.refresh-select").forEach((el) => {
+          el.checked = checked;
+        });
+        syncRefreshSelectAllState();
+        return;
+      }
+
+      if (!target.classList.contains("refresh-select")) return;
+      const pid = String(target.dataset.id || "").trim();
+      if (!pid) return;
+      if (target.checked) refreshSelectedIds.add(pid);
+      else refreshSelectedIds.delete(pid);
+      syncRefreshSelectAllState();
+    });
+  }
 
   async function loadConfig() {
     try {
@@ -503,8 +673,107 @@ document.addEventListener("DOMContentLoaded", () => {
     return `${text.slice(0, maxLen)}...`;
   }
 
+  function parseTokenJsonPayload(value) {
+    if (Array.isArray(value)) {
+      return value.map((v) => String(v || "").trim()).filter(Boolean);
+    }
+    if (value && typeof value === "object") {
+      if (Array.isArray(value.tokens)) {
+        return value.tokens.map((v) => String(v || "").trim()).filter(Boolean);
+      }
+      if (typeof value.token === "string") {
+        const single = value.token.trim();
+        return single ? [single] : [];
+      }
+    }
+    return [];
+  }
+
+  async function collectTokensFromInputs() {
+    const textTokens = String(tokenInput?.value || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const fileList = Array.from(tokenFile?.files || []);
+    const fileTokens = [];
+    for (const file of fileList) {
+      const raw = await file.text();
+      const trimmed = String(raw || "").trim();
+      if (!trimmed) continue;
+
+      const lowerName = String(file.name || "").toLowerCase();
+      if (lowerName.endsWith(".json")) {
+        let parsed;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (_) {
+          throw new Error(`文件 ${file.name} 不是有效 JSON`);
+        }
+        const parsedTokens = parseTokenJsonPayload(parsed);
+        if (!parsedTokens.length) {
+          throw new Error(`文件 ${file.name} 未找到可用 token`);
+        }
+        fileTokens.push(...parsedTokens);
+        continue;
+      }
+
+      fileTokens.push(
+        ...trimmed
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean)
+      );
+    }
+
+    const unique = [];
+    const seen = new Set();
+    for (const token of [...textTokens, ...fileTokens]) {
+      const key = String(token || "").trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      unique.push(key);
+    }
+    return unique;
+  }
+
+  function downloadJsonFile(filename, payload) {
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json;charset=utf-8"
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function nowStamp() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  }
+
+  function syncRefreshSelectAllState() {
+    const header = refreshProfiles?.querySelector("#refreshSelectAll");
+    if (!header) return;
+    const profileIds = latestRefreshProfiles.map((p) => String(p.id || "")).filter(Boolean);
+    const selectedCount = profileIds.filter((id) => refreshSelectedIds.has(id)).length;
+    const total = profileIds.length;
+    header.indeterminate = selectedCount > 0 && selectedCount < total;
+    header.checked = total > 0 && selectedCount === total;
+  }
+
   function renderRefreshProfiles(items) {
     if (!refreshProfiles) return;
+    latestRefreshProfiles = Array.isArray(items) ? items : [];
+    const profileIdSet = new Set(latestRefreshProfiles.map((p) => String(p.id || "")).filter(Boolean));
+    Array.from(refreshSelectedIds).forEach((id) => {
+      if (!profileIdSet.has(id)) refreshSelectedIds.delete(id);
+    });
     if (!Array.isArray(items) || !items.length) {
       refreshProfiles.innerHTML = "<div>暂无自动刷新配置</div>";
       return;
@@ -516,8 +785,11 @@ document.addEventListener("DOMContentLoaded", () => {
       const accountName = escapeHtml(truncateText(fullAccountName, 18));
       const accountEmail = escapeHtml(item.account?.email || "-");
       const errText = state.last_error ? escapeHtml(state.last_error) : "-";
+      const pid = String(item.id || "").trim();
+      const selectedAttr = refreshSelectedIds.has(pid) ? "checked" : "";
       return `
         <tr>
+          <td><input type="checkbox" class="refresh-select" data-id="${pid}" ${selectedAttr} /></td>
           <td style="white-space: nowrap; color: #e7f1fd;" title="${escapeHtml(fullAccountName)}">${accountName}</td>
           <td style="color:#a8bfd8;">${accountEmail}</td>
           <td><span class="status-badge ${enabled ? "status-active" : "status-disabled"}">${enabled ? "启用" : "停用"}</span></td>
@@ -535,6 +807,7 @@ document.addEventListener("DOMContentLoaded", () => {
         <table class="refresh-profiles-table">
           <thead>
             <tr>
+              <th><input id="refreshSelectAll" type="checkbox" title="全选/取消全选" /></th>
               <th>用户名</th>
               <th>邮箱</th>
               <th>状态</th>
@@ -549,6 +822,7 @@ document.addEventListener("DOMContentLoaded", () => {
         </table>
       </div>
     `;
+    syncRefreshSelectAllState();
   }
 
   async function loadRefreshProfiles() {
@@ -556,8 +830,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const res = await fetch("/api/v1/refresh-profiles");
       if (!res.ok) throw new Error("状态加载失败");
       const data = await res.json();
-      latestRefreshProfiles = Array.isArray(data.profiles) ? data.profiles : [];
-      renderRefreshProfiles(latestRefreshProfiles);
+      renderRefreshProfiles(Array.isArray(data.profiles) ? data.profiles : []);
     } catch (err) {
       latestRefreshProfiles = [];
       renderRefreshProfiles([]);
@@ -759,7 +1032,7 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       const rangeValue = logStatsRange ? String(logStatsRange.value || "today") : "today";
       const [logsResult, statsResult] = await Promise.allSettled([
-        fetch("/api/v1/logs?limit=200"),
+        fetch(`/api/v1/logs?limit=${LOGS_PAGE_SIZE}&page=${logsCurrentPage}`),
         fetch(`/api/v1/logs/stats?range=${encodeURIComponent(rangeValue)}`),
       ]);
 
@@ -768,6 +1041,9 @@ document.addEventListener("DOMContentLoaded", () => {
       }
 
       const logsData = await logsResult.value.json();
+      logsCurrentPage = Math.max(1, Number(logsData.page || logsCurrentPage || 1));
+      logsTotalPages = Math.max(1, Number(logsData.total_pages || 1));
+      renderLogsPagination();
       renderLogs(logsData.logs || []);
 
       if (statsResult.status === "fulfilled" && statsResult.value.ok) {
@@ -777,7 +1053,9 @@ document.addEventListener("DOMContentLoaded", () => {
         renderLogStats(null);
       }
     } catch (err) {
-      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state" style="color: #ffb4bc;">${err.message || "日志加载失败"}</td></tr>`;
+      logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state" style="color: #ffb4bc;">${err.message || "日志加载失败"}</td></tr>`;
+      logsTotalPages = Math.max(1, logsCurrentPage || 1);
+      renderLogsPagination();
       renderLogStats(null);
     }
   }
@@ -805,13 +1083,30 @@ document.addEventListener("DOMContentLoaded", () => {
     logStatsUpdatedAt.textContent = `${selectedLabel}统计，更新于 ${updatedText}`;
   }
 
+  function renderLogsPagination() {
+    const safeTotalPages = Math.max(1, Number(logsTotalPages || 1));
+    const safeCurrent = Math.min(Math.max(1, Number(logsCurrentPage || 1)), safeTotalPages);
+    logsCurrentPage = safeCurrent;
+    logsTotalPages = safeTotalPages;
+
+    if (logsPageInfo) {
+      logsPageInfo.textContent = `第 ${safeCurrent} / ${safeTotalPages} 页`;
+    }
+    if (logsPrevBtn) {
+      logsPrevBtn.disabled = safeCurrent <= 1;
+    }
+    if (logsNextBtn) {
+      logsNextBtn.disabled = safeCurrent >= safeTotalPages;
+    }
+  }
+
   function renderLogs(logs) {
     if (logsAutoTimer) {
       clearTimeout(logsAutoTimer);
       logsAutoTimer = null;
     }
     if (!logs.length) {
-      logsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">暂无请求日志</td></tr>`;
+      logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state">暂无请求日志</td></tr>`;
       return;
     }
 
@@ -820,6 +1115,8 @@ document.addEventListener("DOMContentLoaded", () => {
     logs.forEach(item => {
       const tr = document.createElement("tr");
       const dt = new Date((item.ts || 0) * 1000);
+      const dateText = dt.toLocaleDateString();
+      const timeText = dt.toLocaleTimeString();
       const t = Number(item.duration_sec || 0);
       const status = Number(item.status_code || 0);
       const statusClass = status >= 500 ? "log-status-5xx" : (status >= 400 ? "log-status-4xx" : "log-status-2xx");
@@ -841,21 +1138,25 @@ document.addEventListener("DOMContentLoaded", () => {
       if (tokenSource) tokenTitleParts.push(`来源: ${tokenSource}`);
       if (tokenAttempt > 0) tokenTitleParts.push(`尝试: 第${tokenAttempt}次`);
       const tokenTitle = escapeHtml(tokenTitleParts.join(" | "));
-      const tokenCell = tokenName || tokenEmail
-        ? `<span style="color:#a8bfd8;">${escapeHtml(tokenName || tokenEmail)}</span><br><span style="color:#7f96ad;">${escapeHtml(tokenEmail || "-")}</span>`
-        : `<span style="color:#7f96ad;">-</span>`;
+      const accountParts = [];
+      accountParts.push(
+        tokenEmail
+          ? `<span class="log-account-email">${escapeHtml(tokenEmail)}</span>`
+          : `<span class="log-account-email">-</span>`
+      );
+      const modelText = String(item.model || "-");
+      const tokenCell = `<div class="log-account-cell">${accountParts.join("<br>")}</div>`;
       const previewCell = previewUrl
         ? `<button class="small preview-btn" data-url="${encodeURIComponent(previewUrl)}" data-kind="${previewKind || ""}">查看</button>`
         : `<span style="color:#7f96ad;">-</span>`;
       tr.innerHTML = `
-        <td style="white-space: nowrap; color: #a8bfd8;">${dt.toLocaleString()}</td>
+        <td class="log-time-cell"><span class="date">${dateText}</span><span class="time">${timeText}</span></td>
         <td><span class="status-badge ${statusClass}">${status || "-"}</span></td>
         <td style="color:#a8bfd8;">${t}</td>
         <td>${progressCell}</td>
         <td title="${tokenTitle}">${tokenCell}</td>
-        <td class="token-val">${item.model || "-"}</td>
-        <td title="${(item.prompt_preview || "").replace(/"/g, "&quot;")}" style="max-width: 280px; color: #a8bfd8;">${item.prompt_preview || "-"}</td>
-        <td style="font-family: 'IBM Plex Mono', monospace; color:#a8bfd8;">${typeof item.proxy_used === "boolean" ? (item.proxy_used ? "是" : "否") : "-"}</td>
+        <td class="log-model-cell" title="${escapeHtml(modelText)}">${escapeHtml(modelText)}</td>
+        <td class="log-prompt-cell" title="${(item.prompt_preview || "").replace(/"/g, "&quot;")}">${item.prompt_preview || "-"}</td>
         <td>${previewCell}</td>
       `;
       logsTbody.appendChild(tr);
@@ -943,11 +1244,33 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   if (refreshLogsBtn) {
-    refreshLogsBtn.addEventListener("click", loadLogs);
+    refreshLogsBtn.addEventListener("click", () => {
+      logsCurrentPage = 1;
+      loadLogs();
+    });
   }
 
   if (logStatsRange) {
-    logStatsRange.addEventListener("change", loadLogs);
+    logStatsRange.addEventListener("change", () => {
+      logsCurrentPage = 1;
+      loadLogs();
+    });
+  }
+
+  if (logsPrevBtn) {
+    logsPrevBtn.addEventListener("click", () => {
+      if (logsCurrentPage <= 1) return;
+      logsCurrentPage -= 1;
+      loadLogs();
+    });
+  }
+
+  if (logsNextBtn) {
+    logsNextBtn.addEventListener("click", () => {
+      if (logsCurrentPage >= logsTotalPages) return;
+      logsCurrentPage += 1;
+      loadLogs();
+    });
   }
 
   if (clearLogsBtn) {
@@ -956,6 +1279,7 @@ document.addEventListener("DOMContentLoaded", () => {
       try {
         const res = await fetch("/api/v1/logs", { method: "DELETE" });
         if (!res.ok) throw new Error("清空失败");
+        logsCurrentPage = 1;
         loadLogs();
       } catch (err) {
         alert(err.message || "清空失败");
@@ -973,6 +1297,6 @@ document.addEventListener("DOMContentLoaded", () => {
   // Init
   loadTokens();
   loadConfig();
-  loadLogs();
+  renderLogsPagination();
   loadRefreshProfiles();
 });

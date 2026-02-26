@@ -1274,7 +1274,6 @@ class RequestLogRecord:
     path: str
     status_code: int
     duration_sec: int
-    proxy_used: bool
     operation: str
     preview_url: Optional[str] = None
     preview_kind: Optional[str] = None
@@ -1352,12 +1351,23 @@ class RequestLogStore:
             with self._file_path.open("w", encoding="utf-8") as f:
                 f.writelines(out_lines)
 
-    def list(self, limit: int = 100) -> list[dict]:
-        safe_limit = min(max(int(limit or 100), 1), 500)
+    def list(self, limit: int = 20, page: int = 1) -> tuple[list[dict], int]:
+        safe_limit = min(max(int(limit or 20), 1), 100)
+        safe_page = max(int(page or 1), 1)
         with self._lock:
             with self._file_path.open("r", encoding="utf-8") as f:
                 lines = f.readlines()
-        selected = lines[-safe_limit:]
+
+        total = len(lines)
+        if total <= 0:
+            return [], 0
+
+        end = total - (safe_page - 1) * safe_limit
+        start = max(0, end - safe_limit)
+        if end <= 0:
+            return [], total
+
+        selected = lines[start:end]
         data: list[dict] = []
         for line in reversed(selected):
             line = line.strip()
@@ -1369,7 +1379,7 @@ class RequestLogStore:
                     data.append(item)
             except Exception:
                 continue
-        return data
+        return data, total
 
     def stats(
         self,
@@ -1577,7 +1587,6 @@ def _append_attempt_log(
                 path=path,
                 status_code=int(status_code),
                 duration_sec=duration_sec,
-                proxy_used=bool(client.proxy),
                 operation=operation,
                 preview_url=preview_url,
                 preview_kind=preview_kind,
@@ -1609,7 +1618,6 @@ async def request_logger(request: Request, call_next):
     started = time.time()
     method = request.method.upper()
     path = request.url.path
-    proxy_used = False
     preview_url = None
     preview_kind = None
     raw_body = b""
@@ -1660,7 +1668,6 @@ async def request_logger(request: Request, call_next):
             )
             if not has_attempt_logs:
                 duration_sec = int(time.time() - started)
-                proxy_used = bool(client.proxy)
                 preview_url = getattr(request.state, "log_preview_url", None)
                 preview_kind = getattr(request.state, "log_preview_kind", None)
                 task_status = getattr(request.state, "log_task_status", None)
@@ -1691,7 +1698,6 @@ async def request_logger(request: Request, call_next):
                             path=path,
                             status_code=status_code,
                             duration_sec=duration_sec,
-                            proxy_used=proxy_used,
                             operation=operation,
                             preview_url=preview_url,
                             preview_kind=preview_kind,
@@ -1726,6 +1732,10 @@ class TokenAddRequest(BaseModel):
 
 class TokenBatchAddRequest(BaseModel):
     tokens: List[str]
+
+
+class ExportSelectionRequest(BaseModel):
+    ids: Optional[List[str]] = None
 
 
 class TokenCreditsBatchRefreshRequest(BaseModel):
@@ -2198,8 +2208,20 @@ def health():
 
 
 @app.get("/api/v1/logs")
-def list_logs(limit: int = 100):
-    return {"logs": log_store.list(limit=limit)}
+def list_logs(limit: int = 20, page: int = 1):
+    logs, total = log_store.list(limit=limit, page=page)
+    safe_limit = min(max(int(limit or 20), 1), 100)
+    safe_page = max(int(page or 1), 1)
+    total_pages = (total + safe_limit - 1) // safe_limit if total > 0 else 1
+    if safe_page > total_pages:
+        safe_page = total_pages
+    return {
+        "logs": logs,
+        "page": safe_page,
+        "limit": safe_limit,
+        "total": total,
+        "total_pages": total_pages,
+    }
 
 
 def _resolve_logs_stats_range(range_key: str) -> tuple[str, float, float]:
@@ -2303,6 +2325,18 @@ def add_tokens_batch(req: TokenBatchAddRequest):
         raise HTTPException(status_code=400, detail="no valid token provided")
 
     return {"status": "ok", "added_count": added_count}
+
+
+@app.post("/api/v1/tokens/export")
+def export_tokens(req: ExportSelectionRequest):
+    token_ids = req.ids if isinstance(req.ids, list) else None
+    exported = token_manager.export_tokens(token_ids)
+    return {
+        "status": "ok",
+        "total": len(exported),
+        "selected": bool(token_ids),
+        "tokens": exported,
+    }
 
 
 @app.delete("/api/v1/tokens/{tid}")
@@ -2533,6 +2567,18 @@ def update_config(req: ConfigUpdateRequest):
 @app.get("/api/v1/refresh-profiles")
 def refresh_profiles_list():
     return {"profiles": refresh_manager.list_profiles()}
+
+
+@app.post("/api/v1/refresh-profiles/export")
+def refresh_profiles_export(req: ExportSelectionRequest):
+    profile_ids = req.ids if isinstance(req.ids, list) else None
+    exported = refresh_manager.export_bundles(profile_ids)
+    return {
+        "status": "ok",
+        "total": len(exported),
+        "selected": bool(profile_ids),
+        "items": exported,
+    }
 
 
 @app.post("/api/v1/refresh-profiles/import")
@@ -2783,10 +2829,9 @@ def openai_generate(data: dict, request: Request):
         )
     except Exception as exc:
         logger.exception(
-            "Unhandled error in /v1/images/generations log_id=%s model=%s proxy_used=%s",
+            "Unhandled error in /v1/images/generations log_id=%s model=%s",
             getattr(request.state, "log_id", ""),
             resolved_model_id,
-            bool(client.proxy),
         )
         _set_request_task_progress(
             request, task_status="FAILED", task_progress=0.0, error=str(exc)
@@ -3122,12 +3167,11 @@ def chat_completions(data: dict, request: Request):
         )
     except Exception as exc:
         logger.exception(
-            "Unhandled error in /v1/chat/completions log_id=%s model=%s resolved_model=%s is_video_model=%s proxy_used=%s",
+            "Unhandled error in /v1/chat/completions log_id=%s model=%s resolved_model=%s is_video_model=%s",
             getattr(request.state, "log_id", ""),
             model_id,
             resolved_model_id,
             is_video_model,
-            bool(client.proxy),
         )
         _set_request_task_progress(
             request, task_status="FAILED", task_progress=0.0, error=str(exc)
