@@ -38,16 +38,20 @@
       <section class="token-list-card card">
         <div class="list-head">
           <h2>Token 账号池</h2>
-          <button id="refreshBtn" class="secondary">刷新列表</button>
+          <div class="actions">
+            <button id="refreshCreditsBatchBtn" class="secondary">批量刷新积分</button>
+            <button id="refreshBtn" class="secondary">刷新列表</button>
+          </div>
         </div>
         <div class="table-wrapper">
           <table id="tokenTable">
             <thead>
               <tr>
-                <th>ID</th>
+                <th>账号</th>
                 <th>Token (脱敏展示)</th>
                 <th>状态</th>
                 <th>自动刷新</th>
+                <th>积分</th>
                 <th>失败次数</th>
                 <th>有效期</th>
                 <th>操作</th>
@@ -55,7 +59,7 @@
             </thead>
             <tbody>
               <tr>
-                <td colspan="7" class="empty-state">加载中...</td>
+                <td colspan="8" class="empty-state">加载中...</td>
               </tr>
             </tbody>
           </table>
@@ -188,6 +192,7 @@
                 <th>状态</th>
                 <th>耗时(秒)</th>
                 <th>进度</th>
+                <th>Token账号</th>
                 <th>模型</th>
                 <th>提示词摘要</th>
                 <th>使用代理</th>
@@ -213,7 +218,7 @@
         <button id="tokenModalCloseBtn" class="secondary small" type="button">关闭</button>
       </div>
       <div class="add-form">
-        <textarea id="tokenInput" placeholder="在此处粘贴抓取到的 Bearer Token (例如 eyJhbGciOiJSUz...)"></textarea>
+        <textarea id="tokenInput" placeholder="支持批量添加：一行一个 Token（例如\neyJhbGciOiJSUz...\neyJhbGciOiJSUz...）"></textarea>
         <div class="actions">
           <button id="addBtn">确认添加</button>
           <span id="addMsg" class="msg"></span>
@@ -231,22 +236,20 @@
       <div class="config-form">
         <div class="form-group">
           <label for="refreshBundleInput">导入 Refresh Bundle(JSON)</label>
-          <textarea id="refreshBundleInput" rows="7" placeholder="粘贴插件导出的 adobe_refresh_bundle JSON"></textarea>
-          <p class="help">仅在导入后启用自动刷新。JSON 含敏感 Cookie，请谨慎保管。</p>
+          <textarea id="refreshBundleInput" rows="7" placeholder="支持单个对象，或批量数组：[{&quot;name&quot;:&quot;账号A&quot;,&quot;bundle&quot;:{...}},{&quot;name&quot;:&quot;账号B&quot;,&quot;bundle&quot;:{...}}]"></textarea>
+          <p class="help">支持单个或批量导入。导入后会自动立即刷新一次。JSON 含敏感 Cookie，请谨慎保管。</p>
         </div>
 
         <div class="form-group">
-          <label for="refreshBundleFile">或上传 JSON 文件</label>
-          <input type="file" id="refreshBundleFile" accept="application/json,.json" />
+          <label for="refreshBundleFile">或上传 JSON 文件（支持多选）</label>
+          <input type="file" id="refreshBundleFile" accept="application/json,.json" multiple />
         </div>
 
         <div class="actions">
           <button id="importRefreshBtn">导入</button>
-          <button id="refreshNowBtn" class="secondary">立即测试刷新</button>
-          <button id="clearRefreshBtn" class="danger">清除导入</button>
         </div>
 
-        <div id="refreshStatus" class="refresh-status">自动刷新未启用</div>
+        <div id="refreshProfiles" class="refresh-status">暂无自动刷新配置</div>
         <span id="refreshMsg" class="msg"></span>
       </div>
     </div>

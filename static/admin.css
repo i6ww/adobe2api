@@ -215,6 +215,19 @@ textarea#refreshBundleInput {
   line-height: 1.5;
 }
 
+.refresh-status .table-wrapper {
+  margin-top: 6px;
+}
+
+.refresh-profiles-table {
+  font-size: 12px;
+}
+
+.refresh-profiles-table th,
+.refresh-profiles-table td {
+  padding: 8px;
+}
+
 .dialog-modal {
   position: fixed;
   inset: 0;
@@ -408,8 +421,63 @@ td {
 .log-status-5xx { background: rgba(225, 96, 104, 0.2); color: #ffb4bc; }
 
 .action-btns {
-  display: flex;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  min-width: 120px;
+}
+
+.action-btns button {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 11px;
+  border-radius: 4px;
+}
+
+.switch-btn {
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  background: #2b3948;
+  vertical-align: middle;
+}
+
+.switch-btn.on {
+  background: rgba(44, 199, 170, 0.35);
+  border-color: rgba(77, 226, 196, 0.55);
+}
+
+.switch-btn.off {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.switch-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.switch-knob {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transform: translateX(0);
+  transition: transform 0.15s ease;
+}
+
+.switch-btn.on .switch-knob {
+  transform: translateX(18px);
+}
+
+.switch-text {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #a8bfd8;
 }
 
 .empty-state {

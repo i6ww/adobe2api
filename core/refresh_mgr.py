@@ -1,9 +1,10 @@
 import json
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 import requests
 
@@ -21,33 +22,42 @@ class RefreshManager:
         self._lock = threading.Lock()
         self._runner_started = False
         self._stop_event = threading.Event()
-        self._profile: Dict = {}
-        self._state: Dict = {
-            "enabled": False,
-            "has_profile": False,
-            "last_attempt_at": None,
-            "last_success_at": None,
-            "last_error": "",
-            "last_http_status": None,
-            "next_retry_at": None,
-            "consecutive_failures": 0,
-        }
+        self._profiles: List[Dict] = []
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        self._load_profile()
+        self._load_profiles()
 
-    def _load_profile(self):
+    def _load_profiles(self):
         with self._lock:
-            if PROFILE_FILE.exists():
-                try:
-                    self._profile = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
-                    self._state["has_profile"] = bool(self._profile)
-                    self._state["enabled"] = bool(self._profile)
-                    self._state["next_retry_at"] = time.time() + self._refresh_interval_seconds() if self._profile else None
-                except Exception:
-                    self._profile = {}
+            if not PROFILE_FILE.exists():
+                self._profiles = []
+                return
+            try:
+                payload = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                self._profiles = []
+                return
 
-    def _save_profile(self):
-        PROFILE_FILE.write_text(json.dumps(self._profile, indent=2), encoding="utf-8")
+            profiles = payload.get("profiles") if isinstance(payload, dict) else None
+            if not isinstance(profiles, list):
+                self._profiles = []
+                return
+
+            loaded: List[Dict] = []
+            now_ts = int(time.time())
+            for item in profiles:
+                try:
+                    normalized = self._normalize_stored_profile(item, now_ts)
+                except Exception:
+                    continue
+                loaded.append(normalized)
+            self._profiles = loaded
+
+    def _save_profiles(self):
+        payload = {
+            "version": 2,
+            "profiles": self._profiles,
+        }
+        PROFILE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     @staticmethod
     def _validate_bundle(bundle: Dict) -> Dict:
@@ -59,7 +69,9 @@ class RefreshManager:
             raise ValueError("bundle.endpoint is required")
 
         url = str(endpoint.get("url") or "").strip()
-        if not url.startswith("https://adobeid-na1.services.adobe.com/ims/check/v6/token"):
+        if not url.startswith(
+            "https://adobeid-na1.services.adobe.com/ims/check/v6/token"
+        ):
             raise ValueError("invalid endpoint url")
 
         form = endpoint.get("form")
@@ -78,7 +90,10 @@ class RefreshManager:
         normalized_headers = {
             "Accept": str(headers.get("Accept") or "*/*"),
             "Accept-Language": str(headers.get("Accept-Language") or "en-US,en;q=0.9"),
-            "Content-Type": str(headers.get("Content-Type") or "application/x-www-form-urlencoded;charset=UTF-8"),
+            "Content-Type": str(
+                headers.get("Content-Type")
+                or "application/x-www-form-urlencoded;charset=UTF-8"
+            ),
             "Cookie": str(headers.get("Cookie") or "").strip(),
             "Origin": str(headers.get("Origin") or "https://firefly.adobe.com"),
             "Referer": str(headers.get("Referer") or "https://firefly.adobe.com/"),
@@ -92,58 +107,52 @@ class RefreshManager:
         }
 
         return {
-            "type": "adobe_refresh_bundle",
-            "version": int(bundle.get("version") or 1),
-            "imported_at": int(time.time()),
             "endpoint": {
                 "url": url,
                 "method": "POST",
                 "form": normalized_form,
                 "headers": normalized_headers,
-            },
+            }
         }
 
-    def import_bundle(self, bundle: Dict):
-        normalized = self._validate_bundle(bundle)
-        with self._lock:
-            self._profile = normalized
-            self._state["enabled"] = True
-            self._state["has_profile"] = True
-            self._state["last_error"] = ""
-            self._state["consecutive_failures"] = 0
-            self._state["next_retry_at"] = time.time() + self._refresh_interval_seconds()
-            self._save_profile()
+    @classmethod
+    def _normalize_stored_profile(cls, profile: Dict, now_ts: int) -> Dict:
+        if not isinstance(profile, dict):
+            raise ValueError("invalid profile")
+        endpoint = profile.get("endpoint")
+        validated = cls._validate_bundle({"endpoint": endpoint})
+        profile_id = str(profile.get("id") or "").strip() or uuid.uuid4().hex[:8]
+        profile_name = str(profile.get("name") or "").strip()
+        if not profile_name:
+            profile_name = (
+                f"{validated['endpoint']['form']['client_id']}-{profile_id[:4]}"
+            )
 
-    def clear_bundle(self):
-        with self._lock:
-            self._profile = {}
-            self._state = {
-                "enabled": False,
-                "has_profile": False,
-                "last_attempt_at": None,
-                "last_success_at": None,
-                "last_error": "",
-                "last_http_status": None,
-                "next_retry_at": None,
-                "consecutive_failures": 0,
-            }
-            if PROFILE_FILE.exists():
-                PROFILE_FILE.unlink()
-
-    def status(self) -> Dict:
-        with self._lock:
-            endpoint = None
-            if self._profile:
-                endpoint = {
-                    "url": self._profile.get("endpoint", {}).get("url", ""),
-                    "client_id": self._profile.get("endpoint", {}).get("form", {}).get("client_id", ""),
-                }
-            return {
-                **self._state,
-                "endpoint": endpoint,
-                "refresh_interval_hours": self._refresh_interval_hours(),
-                "next_refresh_at_text": self._format_ts(self._state.get("next_retry_at")),
-            }
+        state = profile.get("state") if isinstance(profile.get("state"), dict) else {}
+        account_raw = profile.get("account")
+        account = account_raw if isinstance(account_raw, dict) else {}
+        return {
+            "id": profile_id,
+            "name": profile_name,
+            "enabled": bool(profile.get("enabled", True)),
+            "imported_at": int(profile.get("imported_at") or now_ts),
+            "endpoint": validated["endpoint"],
+            "account": {
+                "display_name": str(account.get("display_name") or "").strip(),
+                "email": str(account.get("email") or "").strip(),
+                "user_id": str(account.get("user_id") or "").strip(),
+                "source": str(account.get("source") or "").strip(),
+                "updated_at": account.get("updated_at"),
+            },
+            "state": {
+                "last_attempt_at": state.get("last_attempt_at"),
+                "last_success_at": state.get("last_success_at"),
+                "last_error": str(state.get("last_error") or ""),
+                "last_http_status": state.get("last_http_status"),
+                "next_retry_at": state.get("next_retry_at"),
+                "consecutive_failures": int(state.get("consecutive_failures") or 0),
+            },
+        }
 
     @staticmethod
     def _format_ts(ts_value) -> str:
@@ -177,56 +186,389 @@ class RefreshManager:
             return None
         return {"http": proxy, "https": proxy}
 
-    def refresh_once(self) -> Dict:
-        with self._lock:
-            profile = dict(self._profile)
-            if not profile:
-                raise ValueError("refresh profile not imported")
-            endpoint = profile.get("endpoint", {})
-            url = endpoint.get("url")
-            headers = dict(endpoint.get("headers") or {})
-            form = dict(endpoint.get("form") or {})
-            self._state["last_attempt_at"] = int(time.time())
+    def _summary_locked(self, profile: Dict) -> Dict:
+        endpoint = profile.get("endpoint", {})
+        form = endpoint.get("form", {})
+        state = profile.get("state", {})
+        account = (
+            profile.get("account") if isinstance(profile.get("account"), dict) else {}
+        )
+        return {
+            "id": profile.get("id"),
+            "name": profile.get("name"),
+            "enabled": bool(profile.get("enabled", True)),
+            "imported_at": profile.get("imported_at"),
+            "endpoint": {
+                "url": endpoint.get("url", ""),
+                "client_id": form.get("client_id", ""),
+            },
+            "account": {
+                "display_name": str(account.get("display_name") or "").strip(),
+                "email": str(account.get("email") or "").strip(),
+                "user_id": str(account.get("user_id") or "").strip(),
+                "updated_at": account.get("updated_at"),
+            },
+            "state": {
+                **state,
+                "next_refresh_at_text": self._format_ts(state.get("next_retry_at")),
+                "last_success_at_text": self._format_ts(state.get("last_success_at")),
+                "last_attempt_at_text": self._format_ts(state.get("last_attempt_at")),
+            },
+            "refresh_interval_hours": self._refresh_interval_hours(),
+        }
 
-        resp = requests.post(url, headers=headers, data=form, timeout=30, proxies=self._requests_proxies())
-        now_ts = int(time.time())
+    def list_profiles(self) -> List[Dict]:
         with self._lock:
-            self._state["last_http_status"] = int(resp.status_code)
+            items = [self._summary_locked(p) for p in self._profiles]
+        items.sort(key=lambda x: int(x.get("imported_at") or 0), reverse=True)
+        return items
+
+    def is_profile_enabled(self, profile_id: str) -> Optional[bool]:
+        pid = str(profile_id or "").strip()
+        if not pid:
+            return None
+        with self._lock:
+            target = self._find_profile_locked(pid)
+            if not target:
+                return None
+            return bool(target.get("enabled", True))
+
+    def import_bundle(self, bundle: Dict, name: Optional[str] = None) -> Dict:
+        validated = self._validate_bundle(bundle)
+        now_ts = int(time.time())
+        profile_id = uuid.uuid4().hex[:8]
+        profile_name = str(name or "").strip()
+        if not profile_name:
+            profile_name = (
+                f"{validated['endpoint']['form']['client_id']}-{profile_id[:4]}"
+            )
+        new_profile = {
+            "id": profile_id,
+            "name": profile_name,
+            "enabled": True,
+            "imported_at": now_ts,
+            "endpoint": validated["endpoint"],
+            "account": {
+                "display_name": "",
+                "email": "",
+                "user_id": "",
+                "source": "",
+                "updated_at": None,
+            },
+            "state": {
+                "last_attempt_at": None,
+                "last_success_at": None,
+                "last_error": "",
+                "last_http_status": None,
+                "next_retry_at": time.time() + self._refresh_interval_seconds(),
+                "consecutive_failures": 0,
+            },
+        }
+        with self._lock:
+            self._profiles.append(new_profile)
+            self._save_profiles()
+            return self._summary_locked(new_profile)
+
+    def _find_profile_locked(self, profile_id: str) -> Optional[Dict]:
+        for p in self._profiles:
+            if p.get("id") == profile_id:
+                return p
+        return None
+
+    def remove_profile(self, profile_id: str):
+        with self._lock:
+            target = self._find_profile_locked(profile_id)
+            if not target:
+                raise KeyError("profile not found")
+            self._profiles = [p for p in self._profiles if p.get("id") != profile_id]
+            self._save_profiles()
+        token_manager.remove_auto_refresh_by_profile(profile_id)
+
+    def set_enabled(self, profile_id: str, enabled: bool) -> Dict:
+        with self._lock:
+            target = self._find_profile_locked(profile_id)
+            if not target:
+                raise KeyError("profile not found")
+            target["enabled"] = bool(enabled)
+            state = target.setdefault("state", {})
+            if enabled:
+                state["next_retry_at"] = time.time() + self._refresh_interval_seconds()
+                state["last_error"] = ""
+                state["consecutive_failures"] = 0
+            self._save_profiles()
+            return self._summary_locked(target)
+
+    def _prepare_refresh(self, profile_id: str) -> Dict:
+        with self._lock:
+            target = self._find_profile_locked(profile_id)
+            if not target:
+                raise KeyError("profile not found")
+            if not bool(target.get("enabled", True)):
+                raise ValueError("profile is disabled")
+            endpoint = target.get("endpoint", {})
+            state = target.setdefault("state", {})
+            state["last_attempt_at"] = int(time.time())
+            snapshot = {
+                "id": target.get("id"),
+                "name": target.get("name"),
+                "url": endpoint.get("url"),
+                "headers": dict(endpoint.get("headers") or {}),
+                "form": dict(endpoint.get("form") or {}),
+            }
+            self._save_profiles()
+            return snapshot
+
+    def _mark_success(self, profile_id: str, http_status: int):
+        with self._lock:
+            target = self._find_profile_locked(profile_id)
+            if not target:
+                return
+            state = target.setdefault("state", {})
+            state["last_http_status"] = int(http_status)
+            state["last_success_at"] = int(time.time())
+            state["last_error"] = ""
+            state["consecutive_failures"] = 0
+            state["next_retry_at"] = time.time() + self._refresh_interval_seconds()
+            self._save_profiles()
+
+    def _mark_failure(
+        self, profile_id: str, message: str, http_status: Optional[int] = None
+    ):
+        with self._lock:
+            target = self._find_profile_locked(profile_id)
+            if not target:
+                return
+            state = target.setdefault("state", {})
+            fails = int(state.get("consecutive_failures", 0)) + 1
+            state["consecutive_failures"] = fails
+            state["last_error"] = str(message or "")[:500]
+            if http_status is not None:
+                state["last_http_status"] = int(http_status)
+            delays = [60, 180, 600, 1800]
+            delay = delays[min(fails - 1, len(delays) - 1)]
+            state["next_retry_at"] = time.time() + delay
+            self._save_profiles()
+
+    def _fetch_account_info(self, access_token: str) -> Dict:
+        token = str(access_token or "").strip()
+        if not token:
+            return {}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        profile_urls = [
+            "https://ims-na1.adobelogin.com/ims/profile/v1",
+            "https://adobeid-na1.services.adobe.com/ims/profile/v1",
+        ]
+        for url in profile_urls:
+            try:
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=15,
+                    proxies=self._requests_proxies(),
+                )
+            except Exception:
+                continue
+            if resp.status_code != 200:
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            display_name = str(
+                data.get("displayName")
+                or data.get("name")
+                or data.get("fullName")
+                or ""
+            ).strip()
+            email = str(data.get("email") or "").strip()
+            user_id = str(data.get("userId") or data.get("authId") or "").strip()
+            if not (display_name or email or user_id):
+                continue
+            return {
+                "display_name": display_name,
+                "email": email,
+                "user_id": user_id,
+                "source": "ims_profile_v1",
+                "updated_at": int(time.time()),
+            }
+        return {}
+
+    @staticmethod
+    def _extract_account_id(access_token: str) -> str:
+        try:
+            payload = token_manager._decode_jwt_payload(access_token)  # type: ignore[attr-defined]
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            return ""
+        return str(
+            payload.get("user_id") or payload.get("aa_id") or payload.get("sub") or ""
+        ).strip()
+
+    def _fetch_credits_balance(self, access_token: str, account_id: str) -> Dict:
+        token = str(access_token or "").strip()
+        aid = str(account_id or "").strip()
+        if not token:
+            raise RuntimeError("empty access token")
+        if not aid:
+            raise RuntimeError("missing account id")
+
+        resp = requests.get(
+            "https://firefly.adobe.io/v1/credits/balance",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "x-api-key": "SunbreakWebUI1",
+                "x-account-id": aid,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=20,
+            proxies=self._requests_proxies(),
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"credits request failed: {resp.status_code}")
+        try:
+            payload = resp.json()
+        except Exception:
+            raise RuntimeError("credits response invalid json")
+        total_info = payload.get("total", {}) if isinstance(payload, dict) else {}
+        quota = total_info.get("quota", {}) if isinstance(total_info, dict) else {}
+        return {
+            "total": quota.get("total"),
+            "used": quota.get("used"),
+            "available": quota.get("available"),
+            "available_until": total_info.get("availableUntil"),
+            "updated_at": int(time.time()),
+        }
+
+    def refresh_credits_for_token_id(self, token_id: str) -> Dict:
+        token_info = token_manager.get_by_id(token_id)
+        if not token_info:
+            raise KeyError("token not found")
+        token_value = str(token_info.get("value") or "").strip()
+        account_id = self._extract_account_id(token_value)
+        credits = self._fetch_credits_balance(token_value, account_id)
+        token_manager.set_credits(token_id, credits)
+        return {
+            "token_id": token_id,
+            "credits": credits,
+        }
+
+    def _set_profile_account(self, profile_id: str, account: Dict):
+        if not account:
+            return
+        with self._lock:
+            target = self._find_profile_locked(profile_id)
+            if not target:
+                return
+            current = (
+                target.get("account") if isinstance(target.get("account"), dict) else {}
+            )
+            merged = {
+                "display_name": str(
+                    account.get("display_name") or current.get("display_name") or ""
+                ).strip(),
+                "email": str(
+                    account.get("email") or current.get("email") or ""
+                ).strip(),
+                "user_id": str(
+                    account.get("user_id") or current.get("user_id") or ""
+                ).strip(),
+                "source": str(
+                    account.get("source") or current.get("source") or ""
+                ).strip(),
+                "updated_at": account.get("updated_at") or current.get("updated_at"),
+            }
+            target["account"] = merged
+            display_name = merged.get("display_name")
+            email = merged.get("email")
+            if display_name or email:
+                target["name"] = display_name or email
+            self._save_profiles()
+
+    def refresh_once(self, profile_id: str) -> Dict:
+        snapshot = self._prepare_refresh(profile_id)
+        resp = requests.post(
+            snapshot["url"],
+            headers=snapshot["headers"],
+            data=snapshot["form"],
+            timeout=30,
+            proxies=self._requests_proxies(),
+        )
 
         if resp.status_code != 200:
-            raise RuntimeError(f"refresh request failed: {resp.status_code} {resp.text[:200]}")
+            self._mark_failure(
+                profile_id,
+                f"refresh request failed: {resp.status_code} {resp.text[:200]}",
+                http_status=resp.status_code,
+            )
+            raise RuntimeError(
+                f"refresh request failed: {resp.status_code} {resp.text[:200]}"
+            )
 
         try:
             data = resp.json()
         except Exception:
+            self._mark_failure(
+                profile_id,
+                "refresh response is not valid json",
+                http_status=resp.status_code,
+            )
             raise RuntimeError("refresh response is not valid json")
 
         token = str(data.get("access_token") or "").strip()
         if not token:
+            self._mark_failure(
+                profile_id,
+                "refresh response missing access_token",
+                http_status=resp.status_code,
+            )
             raise RuntimeError("refresh response missing access_token")
 
-        token_manager.upsert_auto_refresh_token(token)
+        account = self._fetch_account_info(token)
+        if account:
+            self._set_profile_account(profile_id, account)
 
-        with self._lock:
-            self._state["last_success_at"] = now_ts
-            self._state["last_error"] = ""
-            self._state["consecutive_failures"] = 0
-            self._state["next_retry_at"] = time.time() + self._refresh_interval_seconds()
+        profile_name = str(
+            account.get("display_name")
+            or account.get("email")
+            or snapshot["name"]
+            or ""
+        ).strip()
+        profile_email = str(account.get("email") or "").strip()
+
+        token_record = token_manager.upsert_auto_refresh_token(
+            token,
+            profile_id=snapshot["id"],
+            profile_name=profile_name,
+            profile_email=profile_email,
+        )
+
+        credits_error = ""
+        token_id = str(token_record.get("id") or "").strip()
+        if token_id:
+            try:
+                self.refresh_credits_for_token_id(token_id)
+            except Exception as exc:
+                credits_error = str(exc)
+                token_manager.set_credits_error(token_id, credits_error)
+
+        self._mark_success(profile_id, http_status=resp.status_code)
 
         return {
             "status": "ok",
+            "profile_id": snapshot["id"],
+            "profile_name": profile_name,
+            "profile_email": profile_email,
             "expires_in": data.get("expires_in"),
-            "next_retry_at": self._state.get("next_retry_at"),
+            "credits_error": credits_error,
         }
-
-    def _mark_failure(self, message: str):
-        with self._lock:
-            fails = int(self._state.get("consecutive_failures", 0)) + 1
-            self._state["consecutive_failures"] = fails
-            self._state["last_error"] = message[:500]
-            delays = [60, 180, 600, 1800]
-            delay = delays[min(fails - 1, len(delays) - 1)]
-            self._state["next_retry_at"] = time.time() + delay
 
     def start(self):
         with self._lock:
@@ -239,18 +581,33 @@ class RefreshManager:
     def _run(self):
         while not self._stop_event.is_set():
             try:
-                st = self.status()
-                if not st.get("enabled") or not st.get("has_profile"):
-                    time.sleep(2.0)
-                    continue
-                next_retry = st.get("next_retry_at")
-                if next_retry and time.time() < float(next_retry):
-                    time.sleep(2.0)
-                    continue
-                self.refresh_once()
-            except Exception as exc:
-                self._mark_failure(str(exc))
-            time.sleep(1.0)
+                with self._lock:
+                    candidates = [
+                        {
+                            "id": p.get("id"),
+                            "enabled": bool(p.get("enabled", True)),
+                            "next_retry_at": p.get("state", {}).get("next_retry_at"),
+                        }
+                        for p in self._profiles
+                    ]
+
+                now_ts = time.time()
+                for item in candidates:
+                    if not item.get("enabled"):
+                        continue
+                    next_retry = item.get("next_retry_at")
+                    if next_retry and now_ts < float(next_retry):
+                        continue
+                    pid = str(item.get("id") or "")
+                    if not pid:
+                        continue
+                    try:
+                        self.refresh_once(pid)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            time.sleep(2.0)
 
 
 refresh_manager = RefreshManager()

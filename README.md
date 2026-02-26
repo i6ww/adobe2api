@@ -190,14 +190,17 @@ curl -X POST "http://127.0.0.1:6001/v1/images/generations" \
 - `POST /api/v1/tokens`
 - `DELETE /api/v1/tokens/{id}`
 - `PUT /api/v1/tokens/{id}/status?status=active|disabled`
+- `POST /api/v1/tokens/{id}/refresh`
 - `GET /api/v1/config`
 - `PUT /api/v1/config`
 - `GET /api/v1/logs?limit=200`
 - `DELETE /api/v1/logs`
-- `GET /api/v1/refresh-profile/status`
-- `POST /api/v1/refresh-profile/import`
-- `POST /api/v1/refresh-profile/refresh-now`
-- `DELETE /api/v1/refresh-profile`
+- `GET /api/v1/refresh-profiles`
+- `POST /api/v1/refresh-profiles/import`
+- `POST /api/v1/refresh-profiles/import-batch`
+- `POST /api/v1/refresh-profiles/{id}/refresh-now`
+- `PUT /api/v1/refresh-profiles/{id}/enabled`
+- `DELETE /api/v1/refresh-profiles/{id}`
 
 ## 5) Refresh-bundle plugin usage
 
@@ -224,8 +227,14 @@ Capture and import flow:
 3. Open admin UI `Token 管理` tab
 4. Click `导入 Refresh Bundle`
 5. Paste JSON or upload file
-6. Click `导入` then `立即测试刷新`
-7. Token list will show one `自动刷新=是` token
+6. Click `导入` (service auto-runs one refresh immediately)
+7. Token list will show one `自动刷新=是` token per refresh profile
+
+Batch import notes:
+
+- Upload multiple `.json` files at once in the admin dialog, then click `导入`
+- Or paste JSON array:
+  - `[{"name":"account-a","bundle":{...}}, {"name":"account-b","bundle":{...}}]`
 
 ## 6) Storage paths
 

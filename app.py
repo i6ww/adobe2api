@@ -1285,6 +1285,11 @@ class RequestLogRecord:
     task_progress: Optional[float] = None
     upstream_job_id: Optional[str] = None
     retry_after: Optional[int] = None
+    token_id: Optional[str] = None
+    token_account_name: Optional[str] = None
+    token_account_email: Optional[str] = None
+    token_source: Optional[str] = None
+    token_attempt: Optional[int] = None
 
 
 class RequestLogStore:
@@ -1484,16 +1489,6 @@ def _set_request_preview(request: Request, url: str, kind: str = "image") -> Non
         pass
 
 
-def _upsert_request_log_from_state(request: Request, patch: dict) -> None:
-    try:
-        log_id = str(getattr(request.state, "log_id", "") or "")
-        if not log_id:
-            return
-        log_store.upsert(log_id, patch)
-    except Exception:
-        pass
-
-
 def _set_request_task_progress(
     request: Request,
     task_status: str,
@@ -1533,7 +1528,80 @@ def _set_request_task_progress(
     except Exception:
         pass
 
-    _upsert_request_log_from_state(request, patch)
+    # Do not write partial records here.
+    # Final request logs are emitted either by per-attempt logging
+    # (_append_attempt_log) or by middleware finalization.
+
+
+def _set_request_token_context(request: Request, token: str, attempt: int) -> dict:
+    meta = token_manager.get_meta_by_value(token)
+    try:
+        request.state.log_token_id = meta.get("token_id")
+        request.state.log_token_account_name = meta.get("token_account_name")
+        request.state.log_token_account_email = meta.get("token_account_email")
+        request.state.log_token_source = meta.get("token_source")
+        request.state.log_token_attempt = int(attempt)
+    except Exception:
+        pass
+    return meta
+
+
+def _append_attempt_log(
+    request: Request,
+    operation: str,
+    token_meta: dict,
+    attempt: int,
+    attempt_started: float,
+    status_code: int,
+    error: Optional[str] = None,
+) -> None:
+    try:
+        root_log_id = str(getattr(request.state, "log_id", "") or uuid.uuid4().hex[:12])
+        attempt_id = f"{root_log_id}-a{attempt}"
+        method = str(getattr(request, "method", "POST") or "POST").upper()
+        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        model = getattr(request.state, "log_model", None)
+        prompt_preview = getattr(request.state, "log_prompt_preview", None)
+        preview_url = getattr(request.state, "log_preview_url", None)
+        preview_kind = getattr(request.state, "log_preview_kind", None)
+        task_status = getattr(request.state, "log_task_status", None)
+        task_progress = getattr(request.state, "log_task_progress", None)
+        upstream_job_id = getattr(request.state, "log_upstream_job_id", None)
+        retry_after = getattr(request.state, "log_retry_after", None)
+        duration_sec = int(max(0.0, time.time() - float(attempt_started)))
+        log_store.add(
+            RequestLogRecord(
+                id=attempt_id,
+                ts=time.time(),
+                method=method,
+                path=path,
+                status_code=int(status_code),
+                duration_sec=duration_sec,
+                proxy_used=bool(client.proxy),
+                operation=operation,
+                preview_url=preview_url,
+                preview_kind=preview_kind,
+                model=model,
+                prompt_preview=prompt_preview,
+                error=(str(error)[:240] if error else None),
+                task_status=task_status,
+                task_progress=task_progress,
+                upstream_job_id=upstream_job_id,
+                retry_after=retry_after,
+                token_id=str(token_meta.get("token_id") or "") or None,
+                token_account_name=(
+                    str(token_meta.get("token_account_name") or "") or None
+                ),
+                token_account_email=(
+                    str(token_meta.get("token_account_email") or "") or None
+                ),
+                token_source=str(token_meta.get("token_source") or "") or None,
+                token_attempt=int(attempt),
+            )
+        )
+        request.state.log_has_attempt_logs = True
+    except Exception:
+        pass
 
 
 @app.middleware("http")
@@ -1566,6 +1634,8 @@ async def request_logger(request: Request, call_next):
                 "/api/v1/generate",
             }:
                 body_meta = _extract_logging_fields(raw_body)
+                request.state.log_model = body_meta.get("model")
+                request.state.log_prompt_preview = body_meta.get("prompt_preview")
             request.state.log_id = uuid.uuid4().hex[:12]
         except Exception:
             pass
@@ -1585,42 +1655,61 @@ async def request_logger(request: Request, call_next):
         raise
     finally:
         if should_log:
-            duration_sec = int(time.time() - started)
-            proxy_used = bool(client.proxy)
-            preview_url = getattr(request.state, "log_preview_url", None)
-            preview_kind = getattr(request.state, "log_preview_kind", None)
-            task_status = getattr(request.state, "log_task_status", None)
-            task_progress = getattr(request.state, "log_task_progress", None)
-            upstream_job_id = getattr(request.state, "log_upstream_job_id", None)
-            retry_after = getattr(request.state, "log_retry_after", None)
-            error_final = getattr(request.state, "log_error", None) or error_text
-            log_id = (
-                str(getattr(request.state, "log_id", "") or "") or uuid.uuid4().hex[:12]
+            has_attempt_logs = bool(
+                getattr(request.state, "log_has_attempt_logs", False)
             )
-            log_store.upsert(
-                log_id,
-                asdict(
-                    RequestLogRecord(
-                        id=log_id,
-                        ts=time.time(),
-                        method=method,
-                        path=path,
-                        status_code=status_code,
-                        duration_sec=duration_sec,
-                        proxy_used=proxy_used,
-                        operation=operation,
-                        preview_url=preview_url,
-                        preview_kind=preview_kind,
-                        model=body_meta.get("model"),
-                        prompt_preview=body_meta.get("prompt_preview"),
-                        error=error_final,
-                        task_status=task_status,
-                        task_progress=task_progress,
-                        upstream_job_id=upstream_job_id,
-                        retry_after=retry_after,
-                    )
-                ),
-            )
+            if not has_attempt_logs:
+                duration_sec = int(time.time() - started)
+                proxy_used = bool(client.proxy)
+                preview_url = getattr(request.state, "log_preview_url", None)
+                preview_kind = getattr(request.state, "log_preview_kind", None)
+                task_status = getattr(request.state, "log_task_status", None)
+                task_progress = getattr(request.state, "log_task_progress", None)
+                upstream_job_id = getattr(request.state, "log_upstream_job_id", None)
+                retry_after = getattr(request.state, "log_retry_after", None)
+                error_final = getattr(request.state, "log_error", None) or error_text
+                token_id = getattr(request.state, "log_token_id", None)
+                token_account_name = getattr(
+                    request.state, "log_token_account_name", None
+                )
+                token_account_email = getattr(
+                    request.state, "log_token_account_email", None
+                )
+                token_source = getattr(request.state, "log_token_source", None)
+                token_attempt = getattr(request.state, "log_token_attempt", None)
+                log_id = (
+                    str(getattr(request.state, "log_id", "") or "")
+                    or uuid.uuid4().hex[:12]
+                )
+                log_store.upsert(
+                    log_id,
+                    asdict(
+                        RequestLogRecord(
+                            id=log_id,
+                            ts=time.time(),
+                            method=method,
+                            path=path,
+                            status_code=status_code,
+                            duration_sec=duration_sec,
+                            proxy_used=proxy_used,
+                            operation=operation,
+                            preview_url=preview_url,
+                            preview_kind=preview_kind,
+                            model=body_meta.get("model"),
+                            prompt_preview=body_meta.get("prompt_preview"),
+                            error=error_final,
+                            task_status=task_status,
+                            task_progress=task_progress,
+                            upstream_job_id=upstream_job_id,
+                            retry_after=retry_after,
+                            token_id=token_id,
+                            token_account_name=token_account_name,
+                            token_account_email=token_account_email,
+                            token_source=token_source,
+                            token_attempt=token_attempt,
+                        )
+                    ),
+                )
     return response
 
 
@@ -1633,6 +1722,14 @@ class GenerateRequest(BaseModel):
 
 class TokenAddRequest(BaseModel):
     token: str
+
+
+class TokenBatchAddRequest(BaseModel):
+    tokens: List[str]
+
+
+class TokenCreditsBatchRefreshRequest(BaseModel):
+    ids: Optional[List[str]] = None
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -1649,8 +1746,22 @@ class ConfigUpdateRequest(BaseModel):
     token_rotation_strategy: Optional[str] = None
 
 
-class RefreshBundleImportRequest(BaseModel):
+class RefreshProfileImportRequest(BaseModel):
     bundle: dict
+    name: Optional[str] = None
+
+
+class RefreshProfileBatchImportItem(BaseModel):
+    bundle: dict
+    name: Optional[str] = None
+
+
+class RefreshProfileBatchImportRequest(BaseModel):
+    items: List[RefreshProfileBatchImportItem]
+
+
+class RefreshProfileEnabledRequest(BaseModel):
+    enabled: bool
 
 
 def _resolve_model(model_id: Optional[str]) -> dict:
@@ -1697,19 +1808,48 @@ def _run_with_token_retries(
         token = token_manager.get_available(strategy=client.token_rotation_strategy)
         if not token:
             break
+        token_meta = _set_request_token_context(request, token, attempt)
+        attempt_started = time.time()
 
         try:
-            return run_once(token)
+            result = run_once(token)
+            _append_attempt_log(
+                request=request,
+                operation=operation_name,
+                token_meta=token_meta,
+                attempt=attempt,
+                attempt_started=attempt_started,
+                status_code=200,
+            )
+            return result
         except QuotaExhaustedError as exc:
             token_manager.report_exhausted(token)
             last_exc = exc
             retryable = attempt < max_attempts
             retry_reason = "quota_exhausted"
+            _append_attempt_log(
+                request=request,
+                operation=operation_name,
+                token_meta=token_meta,
+                attempt=attempt,
+                attempt_started=attempt_started,
+                status_code=429,
+                error=str(exc),
+            )
         except AuthError as exc:
             token_manager.report_invalid(token)
             last_exc = exc
             retryable = attempt < max_attempts
             retry_reason = "auth"
+            _append_attempt_log(
+                request=request,
+                operation=operation_name,
+                token_meta=token_meta,
+                attempt=attempt,
+                attempt_started=attempt_started,
+                status_code=401,
+                error=str(exc),
+            )
         except UpstreamTemporaryError as exc:
             last_exc = exc
             retryable = attempt < max_attempts and client.should_retry_temporary_error(
@@ -1718,7 +1858,36 @@ def _run_with_token_retries(
             status_part = f"status={exc.status_code}" if exc.status_code else "status=?"
             type_part = f"type={exc.error_type or 'temporary'}"
             retry_reason = f"upstream_temporary {status_part} {type_part}"
+            _append_attempt_log(
+                request=request,
+                operation=operation_name,
+                token_meta=token_meta,
+                attempt=attempt,
+                attempt_started=attempt_started,
+                status_code=int(exc.status_code or 503),
+                error=str(exc),
+            )
+        except HTTPException as exc:
+            _append_attempt_log(
+                request=request,
+                operation=operation_name,
+                token_meta=token_meta,
+                attempt=attempt,
+                attempt_started=attempt_started,
+                status_code=int(exc.status_code or 500),
+                error=str(exc.detail),
+            )
+            raise
         except Exception:
+            _append_attempt_log(
+                request=request,
+                operation=operation_name,
+                token_meta=token_meta,
+                attempt=attempt,
+                attempt_started=attempt_started,
+                status_code=500,
+                error="Unhandled runtime error",
+            )
             raise
 
         if retryable:
@@ -2099,7 +2268,14 @@ def page_root():
 
 @app.get("/api/v1/tokens")
 def list_tokens():
-    return {"tokens": token_manager.list_all()}
+    tokens = token_manager.list_all()
+    for item in tokens:
+        if not bool(item.get("auto_refresh")):
+            item["auto_refresh_enabled"] = None
+            continue
+        pid = str(item.get("refresh_profile_id") or "").strip()
+        item["auto_refresh_enabled"] = refresh_manager.is_profile_enabled(pid)
+    return {"tokens": tokens}
 
 
 @app.post("/api/v1/tokens")
@@ -2108,6 +2284,25 @@ def add_token(req: TokenAddRequest):
         raise HTTPException(status_code=400, detail="Empty token")
     token_manager.add(req.token)
     return {"status": "ok"}
+
+
+@app.post("/api/v1/tokens/batch")
+def add_tokens_batch(req: TokenBatchAddRequest):
+    if not req.tokens:
+        raise HTTPException(status_code=400, detail="tokens is required")
+
+    added_count = 0
+    for raw in req.tokens:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        token_manager.add(token)
+        added_count += 1
+
+    if added_count == 0:
+        raise HTTPException(status_code=400, detail="no valid token provided")
+
+    return {"status": "ok", "added_count": added_count}
 
 
 @app.delete("/api/v1/tokens/{tid}")
@@ -2130,6 +2325,95 @@ def set_token_status(tid: str, status: str):
         )
     token_manager.set_status(tid, status)
     return {"status": "ok"}
+
+
+@app.post("/api/v1/tokens/{tid}/refresh")
+def refresh_token_now(tid: str):
+    token_info = token_manager.get_by_id(tid)
+    if not token_info:
+        raise HTTPException(status_code=404, detail="token not found")
+
+    profile_id = str(token_info.get("refresh_profile_id") or "").strip()
+    if not profile_id:
+        raise HTTPException(
+            status_code=400,
+            detail="this token is not bound to an auto refresh profile",
+        )
+
+    try:
+        result = refresh_manager.refresh_once(profile_id)
+        return {"status": "ok", "result": result}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="refresh profile not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.put("/api/v1/tokens/{tid}/auto-refresh")
+def set_token_auto_refresh_enabled(tid: str, enabled: bool):
+    token_info = token_manager.get_by_id(tid)
+    if not token_info:
+        raise HTTPException(status_code=404, detail="token not found")
+
+    profile_id = str(token_info.get("refresh_profile_id") or "").strip()
+    if not profile_id:
+        raise HTTPException(
+            status_code=400,
+            detail="this token is not bound to an auto refresh profile",
+        )
+    try:
+        profile = refresh_manager.set_enabled(profile_id, bool(enabled))
+        return {"status": "ok", "profile": profile}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="refresh profile not found")
+
+
+@app.post("/api/v1/tokens/{tid}/credits/refresh")
+def refresh_token_credits(tid: str):
+    token_info = token_manager.get_by_id(tid)
+    if not token_info:
+        raise HTTPException(status_code=404, detail="token not found")
+    try:
+        result = refresh_manager.refresh_credits_for_token_id(tid)
+        return {"status": "ok", **result}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="token not found")
+    except Exception as exc:
+        token_manager.set_credits_error(tid, str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/v1/tokens/credits/refresh-batch")
+def refresh_tokens_credits_batch(req: TokenCreditsBatchRefreshRequest):
+    ids = req.ids if isinstance(req.ids, list) else None
+    token_ids: List[str] = []
+    if ids:
+        token_ids = [str(x or "").strip() for x in ids if str(x or "").strip()]
+    else:
+        token_ids = token_manager.list_active_ids()
+
+    if not token_ids:
+        raise HTTPException(status_code=400, detail="no token to refresh")
+
+    refreshed = []
+    failed = []
+    for tid in token_ids:
+        try:
+            refreshed.append(refresh_manager.refresh_credits_for_token_id(tid))
+        except Exception as exc:
+            token_manager.set_credits_error(tid, str(exc))
+            failed.append({"token_id": tid, "detail": str(exc)})
+
+    return {
+        "status": "ok" if not failed else "partial",
+        "total": len(token_ids),
+        "refreshed_count": len(refreshed),
+        "failed_count": len(failed),
+        "refreshed": refreshed,
+        "failed": failed,
+    }
 
 
 @app.get("/api/v1/config")
@@ -2246,34 +2530,123 @@ def update_config(req: ConfigUpdateRequest):
     return config_manager.get_all()
 
 
-@app.get("/api/v1/refresh-profile/status")
-def refresh_profile_status():
-    return refresh_manager.status()
+@app.get("/api/v1/refresh-profiles")
+def refresh_profiles_list():
+    return {"profiles": refresh_manager.list_profiles()}
 
 
-@app.post("/api/v1/refresh-profile/import")
-def refresh_profile_import(req: RefreshBundleImportRequest):
+@app.post("/api/v1/refresh-profiles/import")
+def refresh_profiles_import(req: RefreshProfileImportRequest):
     try:
-        refresh_manager.import_bundle(req.bundle)
-        return {"status": "ok", "detail": "refresh profile imported"}
+        profile = refresh_manager.import_bundle(req.bundle, name=req.name)
+        refresh_result = None
+        refresh_error = ""
+        try:
+            refresh_result = refresh_manager.refresh_once(str(profile.get("id") or ""))
+        except Exception as exc:
+            refresh_error = str(exc)
+        return {
+            "status": "ok" if not refresh_error else "partial",
+            "profile": profile,
+            "refresh_result": refresh_result,
+            "refresh_error": refresh_error,
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@app.post("/api/v1/refresh-profile/refresh-now")
-def refresh_profile_refresh_now():
+@app.post("/api/v1/refresh-profiles/import-batch")
+def refresh_profiles_import_batch(req: RefreshProfileBatchImportRequest):
+    if not req.items:
+        raise HTTPException(status_code=400, detail="items is required")
+
+    imported = []
+    failed = []
+    refreshed = []
+    refresh_failed = []
+    for idx, item in enumerate(req.items):
+        try:
+            profile = refresh_manager.import_bundle(item.bundle, name=item.name)
+            imported.append(profile)
+            try:
+                refresh_result = refresh_manager.refresh_once(
+                    str(profile.get("id") or "")
+                )
+                refreshed.append(
+                    {
+                        "index": idx,
+                        "profile_id": profile.get("id"),
+                        "profile_name": profile.get("name"),
+                        "result": refresh_result,
+                    }
+                )
+            except Exception as exc:
+                refresh_failed.append(
+                    {
+                        "index": idx,
+                        "profile_id": profile.get("id"),
+                        "profile_name": profile.get("name"),
+                        "detail": str(exc),
+                    }
+                )
+        except ValueError as exc:
+            failed.append(
+                {
+                    "index": idx,
+                    "name": item.name,
+                    "detail": str(exc),
+                }
+            )
+
+    result = {
+        "status": (
+            "ok"
+            if (not failed and not refresh_failed)
+            else ("partial" if imported else "failed")
+        ),
+        "total": len(req.items),
+        "imported_count": len(imported),
+        "failed_count": len(failed),
+        "refreshed_count": len(refreshed),
+        "refresh_failed_count": len(refresh_failed),
+        "profiles": imported,
+        "failed": failed,
+        "refreshed": refreshed,
+        "refresh_failed": refresh_failed,
+    }
+    if not imported:
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
+@app.post("/api/v1/refresh-profiles/{profile_id}/refresh-now")
+def refresh_profiles_refresh_now(profile_id: str):
     try:
-        return refresh_manager.refresh_once()
+        return refresh_manager.refresh_once(profile_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="profile not found")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.delete("/api/v1/refresh-profile")
-def refresh_profile_clear():
-    refresh_manager.clear_bundle()
-    return {"status": "ok"}
+@app.put("/api/v1/refresh-profiles/{profile_id}/enabled")
+def refresh_profiles_set_enabled(profile_id: str, req: RefreshProfileEnabledRequest):
+    try:
+        profile = refresh_manager.set_enabled(profile_id, req.enabled)
+        return {"status": "ok", "profile": profile}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="profile not found")
+
+
+@app.delete("/api/v1/refresh-profiles/{profile_id}")
+def refresh_profiles_delete(profile_id: str):
+    try:
+        refresh_manager.remove_profile(profile_id)
+        return {"status": "ok"}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="profile not found")
 
 
 # --- Generation API (OpenAI Compatible structure) ---

@@ -79,24 +79,43 @@ class TokenManager:
             self.save()
             return new_token
 
-    def upsert_auto_refresh_token(self, value: str):
+    def upsert_auto_refresh_token(
+        self,
+        value: str,
+        profile_id: str,
+        profile_name: Optional[str] = None,
+        profile_email: Optional[str] = None,
+    ):
         with self._lock:
             value = value.strip()
             if value.startswith("Bearer "):
                 value = value[7:].strip()
 
-            # Keep only one auto-refresh token record.
-            auto_entries = [t for t in self.tokens if t.get("auto_refresh") is True]
             now_ts = time.time()
-            if auto_entries:
-                target = auto_entries[0]
+            pid = str(profile_id or "").strip()
+            if not pid:
+                raise ValueError("profile_id is required")
+
+            target = None
+            for t in self.tokens:
+                if (
+                    t.get("auto_refresh") is True
+                    and str(t.get("refresh_profile_id") or "").strip() == pid
+                ):
+                    target = t
+                    break
+
+            if target is not None:
                 target["value"] = value
                 target["status"] = "active"
                 target["fails"] = 0
                 target["error_until"] = 0
                 target["updated_at"] = now_ts
-                for extra in auto_entries[1:]:
-                    self.tokens = [t for t in self.tokens if t is not extra]
+                target["source"] = "auto_refresh"
+                target["auto_refresh"] = True
+                target["refresh_profile_id"] = pid
+                target["refresh_profile_name"] = str(profile_name or "").strip() or pid
+                target["refresh_profile_email"] = str(profile_email or "").strip()
                 self.save()
                 return dict(target)
 
@@ -110,6 +129,9 @@ class TokenManager:
                 "error_until": 0,
                 "source": "auto_refresh",
                 "auto_refresh": True,
+                "refresh_profile_id": pid,
+                "refresh_profile_name": str(profile_name or "").strip() or pid,
+                "refresh_profile_email": str(profile_email or "").strip(),
             }
             self.tokens.append(new_token)
             self.save()
@@ -120,12 +142,46 @@ class TokenManager:
             self.tokens = [t for t in self.tokens if t["id"] != tid]
             self.save()
 
+    def remove_auto_refresh_by_profile(self, profile_id: str):
+        pid = str(profile_id or "").strip()
+        if not pid:
+            return
+        with self._lock:
+            self.tokens = [
+                t
+                for t in self.tokens
+                if not (
+                    t.get("auto_refresh") is True
+                    and str(t.get("refresh_profile_id") or "").strip() == pid
+                )
+            ]
+            self.save()
+
     def get_by_id(self, tid: str) -> Optional[Dict]:
         with self._lock:
             for t in self.tokens:
                 if t.get("id") == tid:
                     return dict(t)
         return None
+
+    def get_meta_by_value(self, value: str) -> Dict:
+        token_value = str(value or "").strip()
+        with self._lock:
+            for t in self.tokens:
+                if str(t.get("value") or "").strip() != token_value:
+                    continue
+                return {
+                    "token_id": t.get("id"),
+                    "token_account_name": t.get("refresh_profile_name") or "",
+                    "token_account_email": t.get("refresh_profile_email") or "",
+                    "token_source": t.get("source") or "manual",
+                }
+        return {
+            "token_id": "",
+            "token_account_name": "",
+            "token_account_email": "",
+            "token_source": "manual",
+        }
 
     def set_status(self, tid: str, status: str):
         with self._lock:
@@ -136,6 +192,40 @@ class TokenManager:
                     if status == "active":
                         t["error_until"] = 0
             self.save()
+
+    def set_credits(self, tid: str, credits: Dict):
+        with self._lock:
+            for t in self.tokens:
+                if t.get("id") != tid:
+                    continue
+                t["credits_total"] = credits.get("total")
+                t["credits_used"] = credits.get("used")
+                t["credits_available"] = credits.get("available")
+                t["credits_available_until"] = credits.get("available_until")
+                t["credits_updated_at"] = credits.get("updated_at") or int(time.time())
+                t["credits_error"] = ""
+                self.save()
+                return dict(t)
+        return None
+
+    def set_credits_error(self, tid: str, error_message: str):
+        with self._lock:
+            for t in self.tokens:
+                if t.get("id") != tid:
+                    continue
+                t["credits_error"] = str(error_message or "")[:300]
+                t["credits_updated_at"] = int(time.time())
+                self.save()
+                return dict(t)
+        return None
+
+    def list_active_ids(self) -> List[str]:
+        with self._lock:
+            return [
+                str(t.get("id") or "")
+                for t in self.tokens
+                if t.get("status") == "active"
+            ]
 
     def _pick_active_token_locked(
         self, strategy: str = "round_robin"
@@ -290,6 +380,15 @@ class TokenManager:
                         "error_until": t.get("error_until", 0),
                         "source": t.get("source", "manual"),
                         "auto_refresh": bool(t.get("auto_refresh", False)),
+                        "refresh_profile_id": t.get("refresh_profile_id"),
+                        "refresh_profile_name": t.get("refresh_profile_name"),
+                        "refresh_profile_email": t.get("refresh_profile_email"),
+                        "credits_total": t.get("credits_total"),
+                        "credits_used": t.get("credits_used"),
+                        "credits_available": t.get("credits_available"),
+                        "credits_available_until": t.get("credits_available_until"),
+                        "credits_updated_at": t.get("credits_updated_at"),
+                        "credits_error": t.get("credits_error", ""),
                         "expires_at": exp_ts,
                         "expires_at_text": exp_readable,
                         "remaining_seconds": remaining_seconds,
