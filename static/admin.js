@@ -592,6 +592,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const LOGS_PAGE_SIZE = 20;
   let logsCurrentPage = 1;
   let logsTotalPages = 1;
+  let logsRunningTotal = 0;
 
   if (refreshProfiles) {
     refreshProfiles.addEventListener("change", (event) => {
@@ -1272,10 +1273,17 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!logsTbody) return;
     try {
       const rangeValue = logStatsRange ? String(logStatsRange.value || "today") : "today";
-      const [logsResult, statsResult] = await Promise.allSettled([
+      const [runningResult, logsResult, statsResult] = await Promise.allSettled([
+        fetch("/api/v1/logs/running?limit=200"),
         fetch(`/api/v1/logs?limit=${LOGS_PAGE_SIZE}&page=${logsCurrentPage}`),
         fetch(`/api/v1/logs/stats?range=${encodeURIComponent(rangeValue)}`),
       ]);
+
+      let runningItems = [];
+      if (runningResult.status === "fulfilled" && runningResult.value.ok) {
+        const runningData = await runningResult.value.json();
+        runningItems = Array.isArray(runningData.items) ? runningData.items : [];
+      }
 
       if (logsResult.status !== "fulfilled" || !logsResult.value.ok) {
         throw new Error("加载日志失败");
@@ -1285,7 +1293,7 @@ document.addEventListener("DOMContentLoaded", () => {
       logsCurrentPage = Math.max(1, Number(logsData.page || logsCurrentPage || 1));
       logsTotalPages = Math.max(1, Number(logsData.total_pages || 1));
       renderLogsPagination();
-      renderLogs(logsData.logs || []);
+      renderLogs(logsData.logs || [], runningItems);
 
       if (statsResult.status === "fulfilled" && statsResult.value.ok) {
         const statsData = await statsResult.value.json();
@@ -1295,6 +1303,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     } catch (err) {
       logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state" style="color: #ffb4bc;">${err.message || "日志加载失败"}</td></tr>`;
+      logsRunningTotal = 0;
       logsTotalPages = Math.max(1, logsCurrentPage || 1);
       renderLogsPagination();
       renderLogStats(null);
@@ -1341,69 +1350,94 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  function renderLogs(logs) {
+  function buildLogRow(item, { forceInProgress = false } = {}) {
+    const tr = document.createElement("tr");
+    const dt = new Date((item.ts || 0) * 1000);
+    const dateText = dt.toLocaleDateString();
+    const timeText = dt.toLocaleTimeString();
+    const t = Number(item.duration_sec || 0);
+    const status = Number(item.status_code || 0);
+    const taskStatus = forceInProgress ? "IN_PROGRESS" : String(item.task_status || "").toUpperCase();
+    const isFailed = !forceInProgress && status >= 400;
+    const isRunning = !isFailed && taskStatus === "IN_PROGRESS";
+    const isSuccess = !isRunning && !isFailed;
+    const stateClass = isRunning ? "running" : (isFailed ? "failed" : "success");
+    const stateLabel = isRunning
+      ? "进行中"
+      : (isFailed ? `错误 ${status || "-"}` : "已完成");
+    const stateIcon = isRunning
+      ? `<span class="icon-spinner" aria-hidden="true"></span>`
+      : (isFailed
+        ? `<span class="icon-error" aria-hidden="true">!</span>`
+        : `<span class="icon-check" aria-hidden="true">✓</span>`);
+    const taskProgressRaw = Number(item.task_progress);
+    const progressCell = taskStatus === "IN_PROGRESS"
+      ? `<span class="status-badge status-active">${Number.isFinite(taskProgressRaw) ? Math.round(taskProgressRaw) : 0}%</span>`
+      : `<span style="color:#7f96ad;">-</span>`;
+    const previewUrl = normalizePreviewUrl(String(item.preview_url || "").trim());
+    const previewKind = String(item.preview_kind || "").trim();
+    const tokenName = String(item.token_account_name || "").trim();
+    const tokenEmail = String(item.token_account_email || "").trim();
+    const tokenId = String(item.token_id || "").trim();
+    const tokenSource = String(item.token_source || "").trim();
+    const tokenAttempt = Number(item.token_attempt || 0);
+    const tokenTitleParts = [];
+    if (tokenName) tokenTitleParts.push(`账号: ${tokenName}`);
+    if (tokenId) tokenTitleParts.push(`ID: ${tokenId}`);
+    if (tokenSource) tokenTitleParts.push(`来源: ${tokenSource}`);
+    if (tokenAttempt > 0) tokenTitleParts.push(`尝试: 第${tokenAttempt}次`);
+    const tokenTitle = escapeHtml(tokenTitleParts.join(" | "));
+    const accountParts = [];
+    accountParts.push(
+      tokenEmail
+        ? `<span class="log-account-email">${escapeHtml(tokenEmail)}</span>`
+        : `<span class="log-account-email">-</span>`
+    );
+    const modelText = String(item.model || "-");
+    const tokenCell = `<div class="log-account-cell">${accountParts.join("<br>")}</div>`;
+    const previewCell = previewUrl
+      ? `<button class="small preview-btn" data-url="${encodeURIComponent(previewUrl)}" data-kind="${previewKind || ""}">查看</button>`
+      : `<span style="color:#7f96ad;">-</span>`;
+    tr.innerHTML = `
+      <td class="log-time-cell"><span class="date">${dateText}</span><span class="time">${timeText}</span></td>
+      <td><span class="log-state ${stateClass}">${stateIcon}<span>${stateLabel}</span></span></td>
+      <td style="color:#a8bfd8;">${t}</td>
+      <td>${progressCell}</td>
+      <td title="${tokenTitle}">${tokenCell}</td>
+      <td class="log-model-cell" title="${escapeHtml(modelText)}">${escapeHtml(modelText)}</td>
+      <td class="log-prompt-cell" title="${(item.prompt_preview || "").replace(/"/g, "&quot;")}">${item.prompt_preview || "-"}</td>
+      <td>${previewCell}</td>
+    `;
+    if (isRunning) tr.classList.add("log-row-running");
+    return tr;
+  }
+
+  function renderLogs(logs, runningItems = []) {
     if (logsAutoTimer) {
       clearTimeout(logsAutoTimer);
       logsAutoTimer = null;
     }
-    if (!logs.length) {
+    const runningRows = Array.isArray(runningItems) ? runningItems : [];
+    logsRunningTotal = runningRows.length;
+    const allRows = [
+      ...runningRows,
+      ...(Array.isArray(logs) ? logs : []),
+    ];
+
+    if (!allRows.length) {
       logsTbody.innerHTML = `<tr><td colspan="8" class="empty-state">暂无请求日志</td></tr>`;
       return;
     }
 
     logsTbody.innerHTML = "";
-    let hasInProgress = false;
-    logs.forEach(item => {
-      const tr = document.createElement("tr");
-      const dt = new Date((item.ts || 0) * 1000);
-      const dateText = dt.toLocaleDateString();
-      const timeText = dt.toLocaleTimeString();
-      const t = Number(item.duration_sec || 0);
-      const status = Number(item.status_code || 0);
-      const statusClass = status >= 500 ? "log-status-5xx" : (status >= 400 ? "log-status-4xx" : "log-status-2xx");
-      const taskStatus = String(item.task_status || "").toUpperCase();
-      if (taskStatus === "IN_PROGRESS") hasInProgress = true;
-      const taskProgressRaw = Number(item.task_progress);
-      const progressCell = taskStatus === "IN_PROGRESS"
-        ? `<span class="status-badge status-active">${Number.isFinite(taskProgressRaw) ? Math.round(taskProgressRaw) : 0}%</span>`
-        : `<span style="color:#7f96ad;">-</span>`;
-      const previewUrl = normalizePreviewUrl(String(item.preview_url || "").trim());
-      const previewKind = String(item.preview_kind || "").trim();
-      const tokenName = String(item.token_account_name || "").trim();
-      const tokenEmail = String(item.token_account_email || "").trim();
-      const tokenId = String(item.token_id || "").trim();
-      const tokenSource = String(item.token_source || "").trim();
-      const tokenAttempt = Number(item.token_attempt || 0);
-      const tokenTitleParts = [];
-      if (tokenId) tokenTitleParts.push(`ID: ${tokenId}`);
-      if (tokenSource) tokenTitleParts.push(`来源: ${tokenSource}`);
-      if (tokenAttempt > 0) tokenTitleParts.push(`尝试: 第${tokenAttempt}次`);
-      const tokenTitle = escapeHtml(tokenTitleParts.join(" | "));
-      const accountParts = [];
-      accountParts.push(
-        tokenEmail
-          ? `<span class="log-account-email">${escapeHtml(tokenEmail)}</span>`
-          : `<span class="log-account-email">-</span>`
-      );
-      const modelText = String(item.model || "-");
-      const tokenCell = `<div class="log-account-cell">${accountParts.join("<br>")}</div>`;
-      const previewCell = previewUrl
-        ? `<button class="small preview-btn" data-url="${encodeURIComponent(previewUrl)}" data-kind="${previewKind || ""}">查看</button>`
-        : `<span style="color:#7f96ad;">-</span>`;
-      tr.innerHTML = `
-        <td class="log-time-cell"><span class="date">${dateText}</span><span class="time">${timeText}</span></td>
-        <td><span class="status-badge ${statusClass}">${status || "-"}</span></td>
-        <td style="color:#a8bfd8;">${t}</td>
-        <td>${progressCell}</td>
-        <td title="${tokenTitle}">${tokenCell}</td>
-        <td class="log-model-cell" title="${escapeHtml(modelText)}">${escapeHtml(modelText)}</td>
-        <td class="log-prompt-cell" title="${(item.prompt_preview || "").replace(/"/g, "&quot;")}">${item.prompt_preview || "-"}</td>
-        <td>${previewCell}</td>
-      `;
-      logsTbody.appendChild(tr);
+    runningRows.forEach((item) => {
+      logsTbody.appendChild(buildLogRow(item, { forceInProgress: true }));
+    });
+    (Array.isArray(logs) ? logs : []).forEach((item) => {
+      logsTbody.appendChild(buildLogRow(item));
     });
 
-    if (hasInProgress && isLogsTabActive()) {
+    if (logsRunningTotal > 0 && isLogsTabActive()) {
       logsAutoTimer = setTimeout(() => {
         if (isLogsTabActive()) loadLogs();
       }, LOGS_POLL_MS);

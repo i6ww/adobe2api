@@ -1311,6 +1311,11 @@ class RequestLogStore:
 
     def add(self, item: RequestLogRecord) -> None:
         payload = asdict(item)
+        self.add_payload(payload)
+
+    def add_payload(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
         with self._lock:
             with self._file_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -1451,6 +1456,58 @@ class RequestLogStore:
                 f.write("")
 
 
+class LiveRequestStore:
+    def __init__(self, max_items: int = 2000) -> None:
+        self._lock = threading.Lock()
+        self._items: dict[str, dict] = {}
+        self._max_items = max(100, int(max_items or 2000))
+
+    def upsert(self, item_id: str, payload: dict) -> None:
+        iid = str(item_id or "").strip()
+        if not iid or not isinstance(payload, dict):
+            return
+        with self._lock:
+            old = self._items.get(iid, {})
+            merged = dict(old)
+            merged.update(payload)
+            merged["id"] = iid
+            if not merged.get("ts"):
+                merged["ts"] = time.time()
+            self._items[iid] = merged
+            if len(self._items) > self._max_items:
+                pairs = sorted(
+                    self._items.items(),
+                    key=lambda x: float((x[1] or {}).get("ts") or 0),
+                )
+                overflow = len(self._items) - self._max_items
+                for key, _ in pairs[:overflow]:
+                    self._items.pop(key, None)
+
+    def remove(self, item_id: str) -> None:
+        iid = str(item_id or "").strip()
+        if not iid:
+            return
+        with self._lock:
+            self._items.pop(iid, None)
+
+    def list(self, limit: int = 200) -> list[dict]:
+        safe_limit = min(max(int(limit or 200), 1), 1000)
+        with self._lock:
+            data = list(self._items.values())
+        data.sort(key=lambda x: float((x or {}).get("ts") or 0), reverse=True)
+        return data[:safe_limit]
+
+    def count_in_progress(self) -> int:
+        with self._lock:
+            vals = list(self._items.values())
+        total = 0
+        for item in vals:
+            status = str((item or {}).get("task_status") or "").upper()
+            if status == "IN_PROGRESS":
+                total += 1
+        return total
+
+
 # 极简配置启动
 app = FastAPI(
     title="adobe2api",
@@ -1463,6 +1520,7 @@ app.mount("/generated", StaticFiles(directory=GENERATED_DIR), name="generated_fi
 
 store = JobStore()
 log_store = RequestLogStore(DATA_DIR / "request_logs.jsonl", max_items=5000)
+live_log_store = LiveRequestStore(max_items=2000)
 client = AdobeClient()
 refresh_manager.start()
 
@@ -1489,12 +1547,30 @@ def _extract_logging_fields(raw_body: bytes) -> dict[str, Optional[str]]:
         return {"model": None, "prompt_preview": None}
 
 
+def _upsert_live_request(request: Request, patch: dict) -> None:
+    try:
+        log_id = str(getattr(request.state, "log_id", "") or "").strip()
+        if not log_id or not isinstance(patch, dict):
+            return
+        live_log_store.upsert(log_id, patch)
+    except Exception:
+        pass
+
+
 def _set_request_preview(request: Request, url: str, kind: str = "image") -> None:
     if not url:
         return
     try:
         request.state.log_preview_url = url
         request.state.log_preview_kind = kind
+        _upsert_live_request(
+            request,
+            {
+                "preview_url": url,
+                "preview_kind": kind,
+                "ts": time.time(),
+            },
+        )
     except Exception:
         pass
 
@@ -1535,6 +1611,19 @@ def _set_request_task_progress(
         request.state.log_retry_after = patch.get("retry_after")
         if patch.get("error"):
             request.state.log_error = patch.get("error")
+        _upsert_live_request(
+            request,
+            {
+                "task_status": patch.get("task_status"),
+                "task_progress": patch.get("task_progress"),
+                "upstream_job_id": patch.get("upstream_job_id"),
+                "retry_after": patch.get("retry_after"),
+                "error": patch.get("error"),
+                "model": getattr(request.state, "log_model", None),
+                "prompt_preview": getattr(request.state, "log_prompt_preview", None),
+                "ts": time.time(),
+            },
+        )
     except Exception:
         pass
 
@@ -1551,6 +1640,17 @@ def _set_request_token_context(request: Request, token: str, attempt: int) -> di
         request.state.log_token_account_email = meta.get("token_account_email")
         request.state.log_token_source = meta.get("token_source")
         request.state.log_token_attempt = int(attempt)
+        _upsert_live_request(
+            request,
+            {
+                "token_id": meta.get("token_id"),
+                "token_account_name": meta.get("token_account_name"),
+                "token_account_email": meta.get("token_account_email"),
+                "token_source": meta.get("token_source"),
+                "token_attempt": int(attempt),
+                "ts": time.time(),
+            },
+        )
     except Exception:
         pass
     return meta
@@ -1564,6 +1664,7 @@ def _append_attempt_log(
     attempt_started: float,
     status_code: int,
     error: Optional[str] = None,
+    task_status_override: Optional[str] = None,
 ) -> None:
     try:
         root_log_id = str(getattr(request.state, "log_id", "") or uuid.uuid4().hex[:12])
@@ -1574,12 +1675,15 @@ def _append_attempt_log(
         prompt_preview = getattr(request.state, "log_prompt_preview", None)
         preview_url = getattr(request.state, "log_preview_url", None)
         preview_kind = getattr(request.state, "log_preview_kind", None)
-        task_status = getattr(request.state, "log_task_status", None)
+        task_status = task_status_override
+        if task_status is None:
+            task_status = getattr(request.state, "log_task_status", None)
+        task_status = str(task_status or "").upper() or None
         task_progress = getattr(request.state, "log_task_progress", None)
         upstream_job_id = getattr(request.state, "log_upstream_job_id", None)
         retry_after = getattr(request.state, "log_retry_after", None)
         duration_sec = int(max(0.0, time.time() - float(attempt_started)))
-        log_store.add(
+        payload = asdict(
             RequestLogRecord(
                 id=attempt_id,
                 ts=time.time(),
@@ -1608,6 +1712,11 @@ def _append_attempt_log(
                 token_attempt=int(attempt),
             )
         )
+        records = getattr(request.state, "log_attempt_records", None)
+        if not isinstance(records, list):
+            records = []
+            request.state.log_attempt_records = records
+        records.append(payload)
         request.state.log_has_attempt_logs = True
     except Exception:
         pass
@@ -1645,6 +1754,24 @@ async def request_logger(request: Request, call_next):
                 request.state.log_model = body_meta.get("model")
                 request.state.log_prompt_preview = body_meta.get("prompt_preview")
             request.state.log_id = uuid.uuid4().hex[:12]
+            log_id = str(getattr(request.state, "log_id", "") or "")
+            if log_id:
+                live_log_store.upsert(
+                    log_id,
+                    {
+                        "id": log_id,
+                        "ts": time.time(),
+                        "method": method,
+                        "path": path,
+                        "status_code": 102,
+                        "duration_sec": 0,
+                        "operation": operation,
+                        "model": body_meta.get("model"),
+                        "prompt_preview": body_meta.get("prompt_preview"),
+                        "task_status": "IN_PROGRESS",
+                        "task_progress": 0.0,
+                    },
+                )
         except Exception:
             pass
 
@@ -1666,6 +1793,16 @@ async def request_logger(request: Request, call_next):
             has_attempt_logs = bool(
                 getattr(request.state, "log_has_attempt_logs", False)
             )
+            log_id = (
+                str(getattr(request.state, "log_id", "") or "") or uuid.uuid4().hex[:12]
+            )
+            live_log_store.remove(log_id)
+
+            attempt_records = getattr(request.state, "log_attempt_records", None)
+            if isinstance(attempt_records, list) and attempt_records:
+                for payload in attempt_records:
+                    log_store.add_payload(payload)
+
             if not has_attempt_logs:
                 duration_sec = int(time.time() - started)
                 preview_url = getattr(request.state, "log_preview_url", None)
@@ -1845,6 +1982,7 @@ def _run_with_token_retries(
                 attempt=attempt,
                 attempt_started=attempt_started,
                 status_code=200,
+                task_status_override="COMPLETED",
             )
             return result
         except QuotaExhaustedError as exc:
@@ -1860,6 +1998,7 @@ def _run_with_token_retries(
                 attempt_started=attempt_started,
                 status_code=429,
                 error=str(exc),
+                task_status_override="FAILED",
             )
         except AuthError as exc:
             token_manager.report_invalid(token)
@@ -1874,6 +2013,7 @@ def _run_with_token_retries(
                 attempt_started=attempt_started,
                 status_code=401,
                 error=str(exc),
+                task_status_override="FAILED",
             )
         except UpstreamTemporaryError as exc:
             last_exc = exc
@@ -1891,6 +2031,7 @@ def _run_with_token_retries(
                 attempt_started=attempt_started,
                 status_code=int(exc.status_code or 503),
                 error=str(exc),
+                task_status_override="FAILED",
             )
         except HTTPException as exc:
             _append_attempt_log(
@@ -1901,6 +2042,7 @@ def _run_with_token_retries(
                 attempt_started=attempt_started,
                 status_code=int(exc.status_code or 500),
                 error=str(exc.detail),
+                task_status_override="FAILED",
             )
             raise
         except Exception:
@@ -1912,6 +2054,7 @@ def _run_with_token_retries(
                 attempt_started=attempt_started,
                 status_code=500,
                 error="Unhandled runtime error",
+                task_status_override="FAILED",
             )
             raise
 
@@ -2263,6 +2406,20 @@ def list_logs(limit: int = 20, page: int = 1):
     }
 
 
+@app.get("/api/v1/logs/running")
+def list_running_logs(limit: int = 200):
+    rows = live_log_store.list(limit=limit)
+    items = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("task_status") or "").upper()
+        if status != "IN_PROGRESS":
+            continue
+        items.append(item)
+    return {"items": items, "total": len(items)}
+
+
 def _resolve_logs_stats_range(range_key: str) -> tuple[str, float, float]:
     now_dt = datetime.now()
     now_ts = time.time()
@@ -2284,6 +2441,7 @@ def _resolve_logs_stats_range(range_key: str) -> tuple[str, float, float]:
 def logs_stats(range: str = "today"):
     range_key, start_ts, end_ts = _resolve_logs_stats_range(range)
     payload = log_store.stats(start_ts=start_ts, end_ts=end_ts)
+    payload["in_progress_requests"] = live_log_store.count_in_progress()
     payload.update({"range": range_key, "start_ts": start_ts, "end_ts": end_ts})
     return payload
 
