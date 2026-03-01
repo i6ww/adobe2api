@@ -684,7 +684,10 @@ def _prepare_video_source_image(
     if not image_bytes:
         raise HTTPException(status_code=400, detail="image_url is empty")
     if Image is None:
-        return image_bytes, "image/jpeg"
+        raise HTTPException(
+            status_code=500,
+            detail="Pillow is required for video image preprocessing (resize/crop)",
+        )
 
     res = str(resolution or "720p").lower()
     if res == "1080p":
