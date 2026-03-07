@@ -115,6 +115,15 @@ def build_generation_router(
                         error=update.get("error"),
                     )
 
+                job_id = uuid.uuid4().hex
+                out_path = generated_dir / f"{job_id}.png"
+                old_size = 0
+                try:
+                    if out_path.exists():
+                        old_size = int(out_path.stat().st_size)
+                except Exception:
+                    old_size = 0
+
                 image_bytes, _meta = client.generate(
                     token=token,
                     prompt=prompt,
@@ -127,19 +136,13 @@ def build_generation_router(
                         model_conf.get("upstream_model_version") or "nano-banana-2"
                     ),
                     timeout=client.generate_timeout,
+                    out_path=out_path,
                     progress_cb=_image_progress_cb,
                 )
-
-                job_id = uuid.uuid4().hex
-                out_path = generated_dir / f"{job_id}.png"
-                old_size = 0
-                try:
-                    if out_path.exists():
-                        old_size = int(out_path.stat().st_size)
-                except Exception:
-                    old_size = 0
-                out_path.write_bytes(image_bytes)
-                on_generated_file_written(out_path, old_size, len(image_bytes))
+                if image_bytes is not None:
+                    out_path.write_bytes(image_bytes)
+                new_size = int(out_path.stat().st_size) if out_path.exists() else 0
+                on_generated_file_written(out_path, old_size, new_size)
                 image_url = public_image_url(request, job_id)
                 set_request_preview(request, image_url, kind="image")
                 return {
@@ -318,6 +321,14 @@ def build_generation_router(
                     break
 
                 try:
+                    out_path = generated_dir / f"{job_id}.png"
+                    old_size = 0
+                    try:
+                        if out_path.exists():
+                            old_size = int(out_path.stat().st_size)
+                    except Exception:
+                        old_size = 0
+
                     image_bytes, meta = client.generate(
                         token=token,
                         prompt=prompt,
@@ -329,16 +340,12 @@ def build_generation_router(
                         upstream_model_version=str(
                             model_conf.get("upstream_model_version") or "nano-banana-2"
                         ),
+                        out_path=out_path,
                     )
-                    out_path = generated_dir / f"{job_id}.png"
-                    old_size = 0
-                    try:
-                        if out_path.exists():
-                            old_size = int(out_path.stat().st_size)
-                    except Exception:
-                        old_size = 0
-                    out_path.write_bytes(image_bytes)
-                    on_generated_file_written(out_path, old_size, len(image_bytes))
+                    if image_bytes is not None:
+                        out_path.write_bytes(image_bytes)
+                    new_size = int(out_path.stat().st_size) if out_path.exists() else 0
+                    on_generated_file_written(out_path, old_size, new_size)
                     progress = float(meta.get("progress") or 100.0)
                     image_url = public_image_url(request, job_id)
                     store.update(
@@ -505,6 +512,15 @@ def build_generation_router(
                             error=update.get("error"),
                         )
 
+                    job_id = uuid.uuid4().hex
+                    tmp_path = generated_dir / f"{job_id}.video.tmp"
+                    old_size = 0
+                    try:
+                        if tmp_path.exists():
+                            old_size = int(tmp_path.stat().st_size)
+                    except Exception:
+                        old_size = 0
+
                     video_bytes, video_meta = client.generate_video(
                         token=token,
                         video_conf=video_conf or {},
@@ -516,20 +532,18 @@ def build_generation_router(
                         negative_prompt=negative_prompt,
                         generate_audio=generate_audio,
                         reference_mode=video_reference_mode,
+                        out_path=tmp_path,
                         progress_cb=_video_progress_cb,
                     )
-                    job_id = uuid.uuid4().hex
                     video_ext = video_ext_from_meta(video_meta)
                     filename = f"{job_id}.{video_ext}"
                     out_path = generated_dir / filename
-                    old_size = 0
-                    try:
-                        if out_path.exists():
-                            old_size = int(out_path.stat().st_size)
-                    except Exception:
-                        old_size = 0
-                    out_path.write_bytes(video_bytes)
-                    on_generated_file_written(out_path, old_size, len(video_bytes))
+                    if video_bytes is not None:
+                        out_path.write_bytes(video_bytes)
+                    elif tmp_path.exists():
+                        tmp_path.replace(out_path)
+                    new_size = int(out_path.stat().st_size) if out_path.exists() else 0
+                    on_generated_file_written(out_path, old_size, new_size)
                     image_url = public_generated_url(request, filename)
                     set_request_preview(request, image_url, kind="video")
                     response_content = (
@@ -553,6 +567,15 @@ def build_generation_router(
                             error=update.get("error"),
                         )
 
+                    job_id = uuid.uuid4().hex
+                    out_path = generated_dir / f"{job_id}.png"
+                    old_size = 0
+                    try:
+                        if out_path.exists():
+                            old_size = int(out_path.stat().st_size)
+                    except Exception:
+                        old_size = 0
+
                     image_bytes, _meta = client.generate(
                         token=token,
                         prompt=prompt,
@@ -567,18 +590,13 @@ def build_generation_router(
                         ),
                         source_image_ids=source_image_ids,
                         timeout=client.generate_timeout,
+                        out_path=out_path,
                         progress_cb=_image_progress_cb,
                     )
-                    job_id = uuid.uuid4().hex
-                    out_path = generated_dir / f"{job_id}.png"
-                    old_size = 0
-                    try:
-                        if out_path.exists():
-                            old_size = int(out_path.stat().st_size)
-                    except Exception:
-                        old_size = 0
-                    out_path.write_bytes(image_bytes)
-                    on_generated_file_written(out_path, old_size, len(image_bytes))
+                    if image_bytes is not None:
+                        out_path.write_bytes(image_bytes)
+                    new_size = int(out_path.stat().st_size) if out_path.exists() else 0
+                    on_generated_file_written(out_path, old_size, new_size)
                     image_url = public_image_url(request, job_id)
                     set_request_preview(request, image_url, kind="image")
                     response_content = f"![Generated Image]({image_url})"

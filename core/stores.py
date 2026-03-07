@@ -2,6 +2,7 @@ import json
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
@@ -91,18 +92,31 @@ class RequestLogStore:
         self._file_path = file_path
         self._lock = threading.Lock()
         self._max_items = max_items
+        self._append_since_truncate = 0
+        self._truncate_check_interval = 200
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         if not self._file_path.exists():
             self._file_path.touch()
 
     def _truncate_to_max_locked(self) -> None:
+        tail: deque[str] = deque(maxlen=self._max_items)
+        total = 0
         with self._file_path.open("r", encoding="utf-8") as f:
-            lines = f.readlines()
-        if len(lines) <= self._max_items:
+            for line in f:
+                total += 1
+                tail.append(line)
+        if total <= self._max_items:
             return
-        kept = lines[-self._max_items :]
         with self._file_path.open("w", encoding="utf-8") as f:
-            f.writelines(kept)
+            f.writelines(tail)
+
+    def _append_payload_locked(self, payload: dict) -> None:
+        with self._file_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._append_since_truncate += 1
+        if self._append_since_truncate >= self._truncate_check_interval:
+            self._truncate_to_max_locked()
+            self._append_since_truncate = 0
 
     def add(self, item: RequestLogRecord) -> None:
         payload = asdict(item)
@@ -112,62 +126,41 @@ class RequestLogStore:
         if not isinstance(payload, dict):
             return
         with self._lock:
-            with self._file_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            self._truncate_to_max_locked()
+            self._append_payload_locked(payload)
 
     def upsert(self, item_id: str, payload: dict) -> None:
         if not item_id:
             return
         if not isinstance(payload, dict):
             return
+        item = {"id": item_id}
+        item.update(payload)
         with self._lock:
-            with self._file_path.open("r", encoding="utf-8") as f:
-                lines = f.readlines()
-
-            updated = False
-            out_lines: list[str] = []
-            for line in lines:
-                raw = line.strip()
-                if not raw:
-                    continue
-                try:
-                    item = json.loads(raw)
-                except Exception:
-                    continue
-                if isinstance(item, dict) and str(item.get("id") or "") == item_id:
-                    item.update(payload)
-                    updated = True
-                out_lines.append(json.dumps(item, ensure_ascii=False) + "\n")
-
-            if not updated:
-                item = {"id": item_id}
-                item.update(payload)
-                out_lines.append(json.dumps(item, ensure_ascii=False) + "\n")
-
-            if len(out_lines) > self._max_items:
-                out_lines = out_lines[-self._max_items :]
-
-            with self._file_path.open("w", encoding="utf-8") as f:
-                f.writelines(out_lines)
+            self._append_payload_locked(item)
 
     def list(self, limit: int = 20, page: int = 1) -> tuple[list[dict], int]:
         safe_limit = min(max(int(limit or 20), 1), 100)
         safe_page = max(int(page or 1), 1)
+        window_size = safe_limit * safe_page
+        tail: deque[str] = deque(maxlen=window_size)
+        total = 0
         with self._lock:
             with self._file_path.open("r", encoding="utf-8") as f:
-                lines = f.readlines()
-
-        total = len(lines)
+                for line in f:
+                    total += 1
+                    tail.append(line)
         if total <= 0:
             return [], 0
 
-        end = total - (safe_page - 1) * safe_limit
-        start = max(0, end - safe_limit)
-        if end <= 0:
+        tail_lines = list(tail)
+        available = len(tail_lines)
+        start_from_end = (safe_page - 1) * safe_limit
+        if start_from_end >= available:
             return [], total
 
-        selected = lines[start:end]
+        end_idx = available - start_from_end
+        start_idx = max(0, end_idx - safe_limit)
+        selected = tail_lines[start_idx:end_idx]
         data: list[dict] = []
         for line in reversed(selected):
             line = line.strip()
@@ -186,55 +179,53 @@ class RequestLogStore:
         start_ts: Optional[float] = None,
         end_ts: Optional[float] = None,
     ) -> dict:
-        with self._lock:
-            with self._file_path.open("r", encoding="utf-8") as f:
-                lines = f.readlines()
-
         total_requests = 0
         failed_requests = 0
         generated_images = 0
         generated_videos = 0
         in_progress_requests = 0
 
-        for line in lines:
-            raw = line.strip()
-            if not raw:
-                continue
-            try:
-                item = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(item, dict):
-                continue
+        with self._lock:
+            with self._file_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        item = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(item, dict):
+                        continue
 
-            try:
-                ts_val = float(item.get("ts") or 0)
-            except Exception:
-                ts_val = 0.0
-            if start_ts is not None and ts_val < float(start_ts):
-                continue
-            if end_ts is not None and ts_val > float(end_ts):
-                continue
+                    try:
+                        ts_val = float(item.get("ts") or 0)
+                    except Exception:
+                        ts_val = 0.0
+                    if start_ts is not None and ts_val < float(start_ts):
+                        continue
+                    if end_ts is not None and ts_val > float(end_ts):
+                        continue
 
-            total_requests += 1
+                    total_requests += 1
 
-            try:
-                status_code = int(item.get("status_code") or 0)
-            except Exception:
-                status_code = 0
-            if status_code >= 400:
-                failed_requests += 1
+                    try:
+                        status_code = int(item.get("status_code") or 0)
+                    except Exception:
+                        status_code = 0
+                    if status_code >= 400:
+                        failed_requests += 1
 
-            task_status = str(item.get("task_status") or "").upper()
-            if task_status == "IN_PROGRESS":
-                in_progress_requests += 1
+                    task_status = str(item.get("task_status") or "").upper()
+                    if task_status == "IN_PROGRESS":
+                        in_progress_requests += 1
 
-            preview_kind = str(item.get("preview_kind") or "").strip().lower()
-            if 200 <= status_code < 300:
-                if preview_kind == "image":
-                    generated_images += 1
-                elif preview_kind == "video":
-                    generated_videos += 1
+                    preview_kind = str(item.get("preview_kind") or "").strip().lower()
+                    if 200 <= status_code < 300:
+                        if preview_kind == "image":
+                            generated_images += 1
+                        elif preview_kind == "video":
+                            generated_videos += 1
 
         return {
             "total_requests": total_requests,
@@ -249,6 +240,7 @@ class RequestLogStore:
         with self._lock:
             with self._file_path.open("w", encoding="utf-8") as f:
                 f.write("")
+            self._append_since_truncate = 0
 
 
 @dataclass

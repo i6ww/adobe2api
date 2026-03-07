@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
@@ -396,6 +397,45 @@ class AdobeClient:
             )
         return resp
 
+    def _download_to_file(
+        self,
+        url: str,
+        headers: Optional[dict],
+        out_path: Path,
+        timeout: int = 60,
+        chunk_size: int = 1024 * 1024,
+    ) -> int:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        total = 0
+        try:
+            with requests.get(
+                url,
+                headers=headers or {},
+                timeout=timeout,
+                proxies=self._requests_proxies(),
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                with out_path.open("wb") as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        total += len(chunk)
+        except requests.Timeout as exc:
+            raise UpstreamTemporaryError(f"upstream timeout: {exc}", error_type="timeout")
+        except requests.ProxyError as exc:
+            raise UpstreamTemporaryError(
+                f"upstream proxy error: {exc}", error_type="proxy"
+            )
+        except requests.ConnectionError as exc:
+            raise UpstreamTemporaryError(
+                f"upstream connection error: {exc}", error_type="connection"
+            )
+        except requests.RequestException as exc:
+            raise UpstreamTemporaryError(f"upstream request error: {exc}", error_type="network")
+        return total
+
     def upload_image(
         self, token: str, image_bytes: bytes, mime_type: str = "image/jpeg"
     ) -> str:
@@ -717,8 +757,9 @@ class AdobeClient:
         negative_prompt: str = "",
         generate_audio: bool = True,
         reference_mode: str = "frame",
+        out_path: Optional[Path] = None,
         progress_cb: Optional[Callable[[dict], None]] = None,
-    ) -> tuple[bytes, dict]:
+    ) -> tuple[Optional[bytes], dict]:
         payload = self._build_video_payload(
             video_conf=video_conf,
             prompt=prompt,
@@ -818,8 +859,18 @@ class AdobeClient:
                 video_url = ((outputs[0] or {}).get("video") or {}).get("presignedUrl")
                 if not video_url:
                     raise AdobeRequestError("video job finished without video url")
-                video_resp = self._get(video_url, headers={"accept": "*/*"}, timeout=60)
-                video_resp.raise_for_status()
+                if out_path is not None:
+                    self._download_to_file(
+                        video_url,
+                        headers={"accept": "*/*"},
+                        out_path=out_path,
+                        timeout=60,
+                    )
+                    video_bytes = None
+                else:
+                    video_resp = self._get(video_url, headers={"accept": "*/*"}, timeout=60)
+                    video_resp.raise_for_status()
+                    video_bytes = video_resp.content
                 if progress_cb:
                     try:
                         progress_cb(
@@ -832,7 +883,7 @@ class AdobeClient:
                         )
                     except Exception:
                         pass
-                return video_resp.content, latest
+                return video_bytes, latest
 
             if status_val in {"FAILED", "CANCELLED", "ERROR"}:
                 if progress_cb:
@@ -882,8 +933,9 @@ class AdobeClient:
         upstream_model_version: str = "nano-banana-2",
         source_image_ids: Optional[list[str]] = None,
         timeout: int = 180,
+        out_path: Optional[Path] = None,
         progress_cb: Optional[Callable[[dict], None]] = None,
-    ) -> tuple[bytes, dict]:
+    ) -> tuple[Optional[bytes], dict]:
         submit_resp = None
         last_error = ""
         for payload in self._build_payload_candidates(
@@ -1013,8 +1065,18 @@ class AdobeClient:
                 image_url = ((outputs[0] or {}).get("image") or {}).get("presignedUrl")
                 if not image_url:
                     raise AdobeRequestError("job finished without image url")
-                img_resp = self._get(image_url, headers={"accept": "*/*"}, timeout=30)
-                img_resp.raise_for_status()
+                if out_path is not None:
+                    self._download_to_file(
+                        image_url,
+                        headers={"accept": "*/*"},
+                        out_path=out_path,
+                        timeout=30,
+                    )
+                    image_bytes = None
+                else:
+                    img_resp = self._get(image_url, headers={"accept": "*/*"}, timeout=30)
+                    img_resp.raise_for_status()
+                    image_bytes = img_resp.content
                 if progress_cb:
                     try:
                         progress_cb(
@@ -1027,7 +1089,7 @@ class AdobeClient:
                         )
                     except Exception:
                         pass
-                return img_resp.content, latest
+                return image_bytes, latest
 
             if status_val in {"FAILED", "CANCELLED", "ERROR"}:
                 if progress_cb:
