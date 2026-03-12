@@ -41,6 +41,7 @@
           <div class="actions">
             <button id="exportTokensBtn" class="secondary">导出 Token</button>
             <button id="exportCookiesBtn" class="secondary">导出 Cookie</button>
+            <button id="deleteTokensBatchBtn" class="danger">批量删除</button>
             <button id="refreshCreditsBatchBtn" class="secondary">批量刷新积分</button>
             <button id="refreshBtn" class="secondary">刷新列表</button>
           </div>
@@ -184,6 +185,12 @@
               <p class="help">范围 1-24 小时。后台将严格按该间隔刷新。</p>
             </div>
 
+            <div class="form-group">
+              <label for="confBatchConcurrency">批量导入/积分并发数</label>
+              <input type="number" id="confBatchConcurrency" class="input-text" min="1" max="100" step="1" placeholder="默认 5" />
+              <p class="help">用于批量导入 Cookie 时的自动刷新与积分查询，以及批量刷新积分。默认并行 5 个。</p>
+            </div>
+
             <div class="config-inline-row">
               <div class="form-group inline-item">
                 <label for="confGeneratedMaxSizeMb">生成文件空间上限 (MB)</label>
@@ -316,8 +323,6 @@
         <div class="actions">
           <button id="importCookieBtn" class="secondary">导入 Cookie</button>
         </div>
-
-        <div id="refreshProfiles" class="refresh-status">暂无自动刷新配置</div>
         <span id="refreshMsg" class="msg"></span>
       </div>
     </div>

@@ -63,6 +63,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const openCookieImportBtn = document.getElementById("openCookieImportBtn");
   const exportTokensBtn = document.getElementById("exportTokensBtn");
   const exportCookiesBtn = document.getElementById("exportCookiesBtn");
+  const deleteTokensBatchBtn = document.getElementById("deleteTokensBatchBtn");
   const refreshModal = document.getElementById("refreshModal");
   const refreshModalCloseBtn = document.getElementById("refreshModalCloseBtn");
   const refreshBtn = document.getElementById("refreshBtn");
@@ -381,7 +382,6 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   if (openCookieImportBtn) {
     openCookieImportBtn.addEventListener("click", async () => {
-      await loadRefreshProfiles();
       openDialog(refreshModal);
       if (cookieInput) cookieInput.focus();
     });
@@ -398,10 +398,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   window.deleteToken = async (id) => {
     if (!confirm("确定要删除这个 Token 吗？")) return;
     try {
-      await fetch(`/api/v1/tokens/${id}`, { method: "DELETE" });
-      loadTokens();
+      const res = await fetch(`/api/v1/tokens/${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || "删除失败");
+      }
+      await loadTokens();
     } catch (err) {
-      alert("删除失败");
+      alert(err.message || "删除失败");
     }
   };
 
@@ -438,7 +442,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       showMsg(refreshMsg, "刷新成功", false);
       showToast("Token 刷新成功", false);
       await loadTokens();
-      await loadRefreshProfiles();
     } catch (err) {
       alert("刷新失败");
       showToast("Token 刷新失败", true);
@@ -486,7 +489,6 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
       await loadTokens();
-      await loadRefreshProfiles();
     } catch (err) {
       alert("自动刷新设置失败");
     }
@@ -526,6 +528,56 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
 
+  if (deleteTokensBatchBtn) {
+    deleteTokensBatchBtn.addEventListener("click", async () => {
+      const selectedIds = Array.from(tokenSelectedIds);
+      if (!selectedIds.length) {
+        alert("请先选择要删除的 Token");
+        return;
+      }
+      if (!confirm(`确定批量删除选中的 ${selectedIds.length} 个 Token 吗？`)) return;
+
+      deleteTokensBatchBtn.disabled = true;
+      try {
+        const res = await fetch("/api/v1/tokens/delete-batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids: selectedIds }),
+        });
+        if (!res.ok) {
+          let detail = "批量删除失败";
+          try {
+            const body = await res.json();
+            detail = body.detail || JSON.stringify(body);
+          } catch (_) {
+            detail = await res.text();
+          }
+          throw new Error(detail || "批量删除失败");
+        }
+
+        const data = await res.json();
+        const deletedIds = Array.isArray(data.deleted_ids) ? data.deleted_ids : [];
+        deletedIds.forEach((id) => tokenSelectedIds.delete(String(id || "")));
+        await loadTokens();
+
+        const deletedCount = Number(data.deleted_count || 0);
+        const missingCount = Number(data.missing_count || 0);
+        showToast(
+          missingCount > 0
+            ? `批量删除完成：成功 ${deletedCount}，未找到 ${missingCount}`
+            : `批量删除完成：成功删除 ${deletedCount} 个 Token`,
+          false,
+          { duration: 5000 }
+        );
+      } catch (err) {
+        alert(err.message || "批量删除失败");
+        showToast(err.message || "批量删除失败", true);
+      } finally {
+        deleteTokensBatchBtn.disabled = false;
+      }
+    });
+  }
+
   if (exportTokensBtn) {
     exportTokensBtn.addEventListener("click", async () => {
       exportTokensBtn.disabled = true;
@@ -561,7 +613,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     exportCookiesBtn.addEventListener("click", async () => {
       exportCookiesBtn.disabled = true;
       try {
-        const selectedIds = Array.from(refreshSelectedIds);
+        const selectedIds = Array.from(tokenSelectedIds);
         const payload = selectedIds.length ? { ids: selectedIds } : { ids: null };
         const res = await fetch("/api/v1/refresh-profiles/export-cookies", {
           method: "POST",
@@ -614,6 +666,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const confRetryOnErrorTypes = document.getElementById("confRetryOnErrorTypes");
   const confTokenRotationStrategy = document.getElementById("confTokenRotationStrategy");
   const confRefreshIntervalHours = document.getElementById("confRefreshIntervalHours");
+  const confBatchConcurrency = document.getElementById("confBatchConcurrency");
   const confGeneratedMaxSizeMb = document.getElementById("confGeneratedMaxSizeMb");
   const confGeneratedPruneSizeMb = document.getElementById("confGeneratedPruneSizeMb");
   const generatedUsageInfo = document.getElementById("generatedUsageInfo");
@@ -624,10 +677,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const cookieInput = document.getElementById("cookieInput");
   const cookieFile = document.getElementById("cookieFile");
   const importCookieBtn = document.getElementById("importCookieBtn");
-  const refreshProfiles = document.getElementById("refreshProfiles");
   const refreshMsg = document.getElementById("refreshMsg");
-  let latestRefreshProfiles = [];
-  const refreshSelectedIds = new Set();
+  let currentBatchConcurrency = 5;
   // Logs
   const logsTbody = document.querySelector("#logsTable tbody");
   const refreshLogsBtn = document.getElementById("refreshLogsBtn");
@@ -680,36 +731,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     );
   }
 
-  if (refreshProfiles) {
-    refreshProfiles.addEventListener("change", (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLInputElement)) return;
-      if (target.id === "refreshSelectAll") {
-        const checked = Boolean(target.checked);
-        if (checked) {
-          latestRefreshProfiles.forEach((item) => {
-            const pid = String(item.id || "").trim();
-            if (pid) refreshSelectedIds.add(pid);
-          });
-        } else {
-          refreshSelectedIds.clear();
-        }
-        refreshProfiles.querySelectorAll("input.refresh-select").forEach((el) => {
-          el.checked = checked;
-        });
-        syncRefreshSelectAllState();
-        return;
-      }
-
-      if (!target.classList.contains("refresh-select")) return;
-      const pid = String(target.dataset.id || "").trim();
-      if (!pid) return;
-      if (target.checked) refreshSelectedIds.add(pid);
-      else refreshSelectedIds.delete(pid);
-      syncRefreshSelectAllState();
-    });
-  }
-
   async function loadConfig() {
     try {
       const res = await fetch("/api/v1/config");
@@ -733,6 +754,8 @@ document.addEventListener("DOMContentLoaded", async () => {
           : "timeout,connection,proxy";
         confTokenRotationStrategy.value = String(data.token_rotation_strategy || "round_robin");
         confRefreshIntervalHours.value = Number(data.refresh_interval_hours || 15);
+        currentBatchConcurrency = Math.max(1, Math.min(100, Number(data.batch_concurrency || 5)));
+        confBatchConcurrency.value = currentBatchConcurrency;
         confGeneratedMaxSizeMb.value = Number(data.generated_max_size_mb || 1024);
         confGeneratedPruneSizeMb.value = Number(data.generated_prune_size_mb || 200);
         if (generatedUsageInfo) {
@@ -775,6 +798,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           .filter(Boolean),
         token_rotation_strategy: String(confTokenRotationStrategy.value || "round_robin").trim() || "round_robin",
         refresh_interval_hours: Number(confRefreshIntervalHours.value || 15),
+        batch_concurrency: Math.max(1, Math.min(100, Number(confBatchConcurrency.value || 5))),
         generated_max_size_mb: Math.max(100, Math.min(102400, Number(confGeneratedMaxSizeMb.value || 1024))),
         generated_prune_size_mb: Math.max(10, Math.min(10240, Number(confGeneratedPruneSizeMb.value || 200))),
       };
@@ -788,6 +812,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       if (!Number.isInteger(payload.refresh_interval_hours) || payload.refresh_interval_hours < 1 || payload.refresh_interval_hours > 24) {
         throw new Error("自动刷新间隔必须是 1-24 的整数小时");
+      }
+      if (!Number.isInteger(payload.batch_concurrency) || payload.batch_concurrency < 1 || payload.batch_concurrency > 100) {
+        throw new Error("批量导入/积分并发数必须是 1-100 的整数");
       }
       if (!Number.isInteger(payload.generated_max_size_mb) || payload.generated_max_size_mb < 100 || payload.generated_max_size_mb > 102400) {
         throw new Error("生成文件空间上限必须是 100-102400 的整数 MB");
@@ -934,86 +961,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
   }
 
-  function syncRefreshSelectAllState() {
-    const header = refreshProfiles?.querySelector("#refreshSelectAll");
-    if (!header) return;
-    const profileIds = latestRefreshProfiles.map((p) => String(p.id || "")).filter(Boolean);
-    const selectedCount = profileIds.filter((id) => refreshSelectedIds.has(id)).length;
-    const total = profileIds.length;
-    header.indeterminate = selectedCount > 0 && selectedCount < total;
-    header.checked = total > 0 && selectedCount === total;
-  }
-
-  function renderRefreshProfiles(items) {
-    if (!refreshProfiles) return;
-    latestRefreshProfiles = Array.isArray(items) ? items : [];
-    const profileIdSet = new Set(latestRefreshProfiles.map((p) => String(p.id || "")).filter(Boolean));
-    Array.from(refreshSelectedIds).forEach((id) => {
-      if (!profileIdSet.has(id)) refreshSelectedIds.delete(id);
-    });
-    if (!Array.isArray(items) || !items.length) {
-      refreshProfiles.innerHTML = "<div>暂无自动刷新配置</div>";
-      return;
-    }
-    const rows = items.map((item) => {
-      const state = item.state || {};
-      const enabled = Boolean(item.enabled);
-      const fullAccountName = String(item.account?.display_name || item.name || "-");
-      const accountName = escapeHtml(truncateText(fullAccountName, 18));
-      const accountEmail = escapeHtml(item.account?.email || "-");
-      const errText = state.last_error ? escapeHtml(state.last_error) : "-";
-      const pid = String(item.id || "").trim();
-      const selectedAttr = refreshSelectedIds.has(pid) ? "checked" : "";
-      return `
-        <tr>
-          <td><input type="checkbox" class="refresh-select" data-id="${pid}" ${selectedAttr} /></td>
-          <td style="white-space: nowrap; color: #e7f1fd;" title="${escapeHtml(fullAccountName)}">${accountName}</td>
-          <td style="color:#a8bfd8;">${accountEmail}</td>
-          <td><span class="status-badge ${enabled ? "status-active" : "status-disabled"}">${enabled ? "启用" : "停用"}</span></td>
-          <td style="color:#a8bfd8;">${state.last_success_at_text || formatTs(state.last_success_at)}</td>
-          <td style="max-width: 280px; color:#a8bfd8;" title="${errText}">${errText}</td>
-          <td class="action-btns">
-            <button class="danger" onclick="deleteRefreshProfileById('${item.id}')">删除</button>
-          </td>
-        </tr>
-      `;
-    });
-    refreshProfiles.innerHTML = `
-      <div style="margin-bottom: 8px; color:#7f96ad;">共 ${items.length} 个刷新配置</div>
-      <div class="table-wrapper">
-        <table class="refresh-profiles-table">
-          <thead>
-            <tr>
-              <th><input id="refreshSelectAll" type="checkbox" title="全选/取消全选" /></th>
-              <th>用户名</th>
-              <th>邮箱</th>
-              <th>状态</th>
-              <th>最近成功</th>
-              <th>最近错误</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows.join("")}
-          </tbody>
-        </table>
-      </div>
-    `;
-    syncRefreshSelectAllState();
-  }
-
-  async function loadRefreshProfiles() {
-    try {
-      const res = await fetch("/api/v1/refresh-profiles");
-      if (!res.ok) throw new Error("状态加载失败");
-      const data = await res.json();
-      renderRefreshProfiles(Array.isArray(data.profiles) ? data.profiles : []);
-    } catch (err) {
-      latestRefreshProfiles = [];
-      renderRefreshProfiles([]);
-    }
-  }
-
   function cookieToHeaderString(value) {
     if (typeof value === "string") {
       const txt = value.trim();
@@ -1102,101 +1049,103 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
+    const batchLimit = Math.max(1, Math.min(100, Number(confBatchConcurrency?.value || currentBatchConcurrency || 5)));
     try {
-      const endpoint = items.length > 1
-        ? "/api/v1/refresh-profiles/import-cookie-batch"
-        : "/api/v1/refresh-profiles/import-cookie";
-      const payload = items.length > 1
-        ? { items }
-        : { cookie: items[0].cookie, name: items[0].name || null };
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        let detailText = "Cookie 导入失败";
-        try {
-          const body = await res.json();
-          const detail = body?.detail;
-          if (typeof detail === "string") {
-            detailText = detail;
-          } else if (detail && typeof detail === "object") {
-            const failedCount = Number(detail.failed_count || 0);
-            const refreshFailedCount = Number(detail.refresh_failed_count || 0);
-            detailText = `导入失败（成功 ${Number(detail.imported_count || 0)}，导入失败 ${failedCount}，刷新失败 ${refreshFailedCount}）`;
-          }
-        } catch (_) {
-          const txt = await res.text();
-          if (txt) detailText = txt;
-        }
-        throw new Error(detailText);
-      }
+      if (importCookieBtn) importCookieBtn.disabled = true;
+      const workerCount = Math.min(batchLimit, items.length);
+      const progress = {
+        total: items.length,
+        completed: 0,
+        imported: 0,
+        failed: 0,
+        refreshFailed: 0,
+      };
+      const results = new Array(items.length);
 
-      const result = await res.json();
-      if (items.length > 1) {
-        const okCount = Number(result.imported_count || 0);
-        const failedCount = Number(result.failed_count || 0);
-        const refreshFailedCount = Number(result.refresh_failed_count || 0);
+      const updateImportProgress = () => {
         showMsg(
           refreshMsg,
-          `批量 Cookie 导入完成：成功 ${okCount}，导入失败 ${failedCount}，刷新失败 ${refreshFailedCount}`,
-          failedCount > 0 || refreshFailedCount > 0
+          `已解析 ${progress.total} 个 Cookie，处理中 ${progress.completed}/${progress.total}，导入成功 ${progress.imported}，导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}（并行 ${workerCount} 个）...`,
+          progress.failed > 0 || progress.refreshFailed > 0,
+          { duration: 0 }
+        );
+      };
+
+      const importOne = async (item) => {
+        const res = await fetch("/api/v1/refresh-profiles/import-cookie", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cookie: item.cookie, name: item.name || null }),
+        });
+        if (!res.ok) {
+          let detailText = "Cookie 导入失败";
+          try {
+            const body = await res.json();
+            if (typeof body?.detail === "string") detailText = body.detail;
+          } catch (_) {
+            const txt = await res.text();
+            if (txt) detailText = txt;
+          }
+          throw new Error(detailText);
+        }
+        return res.json();
+      };
+
+      updateImportProgress();
+      let nextIndex = 0;
+      const runWorker = async () => {
+        while (true) {
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+          if (currentIndex >= items.length) return;
+
+          try {
+            const result = await importOne(items[currentIndex]);
+            results[currentIndex] = result;
+            progress.imported += 1;
+            if (String(result.refresh_error || "").trim()) {
+              progress.refreshFailed += 1;
+            }
+          } catch (err) {
+            results[currentIndex] = { error: err };
+            progress.failed += 1;
+          } finally {
+            progress.completed += 1;
+            updateImportProgress();
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
+      if (items.length > 1) {
+        showMsg(
+          refreshMsg,
+          `批量 Cookie 导入完成：成功 ${progress.imported}，导入失败 ${progress.failed}，刷新失败 ${progress.refreshFailed}`,
+          progress.failed > 0 || progress.refreshFailed > 0,
+          { duration: 8000 }
         );
       } else {
-        const refreshError = String(result.refresh_error || "").trim();
+        const singleResult = results[0];
+        const refreshError = String(singleResult?.refresh_error || "").trim();
+        if (singleResult?.error) {
+          throw singleResult.error;
+        }
         if (refreshError) {
-          showMsg(refreshMsg, `Cookie 导入成功，但自动刷新失败：${refreshError}`, true);
+          showMsg(refreshMsg, `Cookie 导入成功，但自动刷新失败：${refreshError}`, true, { duration: 8000 });
         } else {
-          showMsg(refreshMsg, "Cookie 导入成功，并已自动刷新", false);
+          showMsg(refreshMsg, "Cookie 导入成功，并已自动刷新", false, { duration: 8000 });
         }
       }
       if (cookieInput) cookieInput.value = "";
       if (cookieFile) cookieFile.value = "";
-      await loadRefreshProfiles();
       await loadTokens();
     } catch (err) {
-      showMsg(refreshMsg, err.message || "Cookie 导入失败", true);
+      showMsg(refreshMsg, err.message || "Cookie 导入失败", true, { duration: 8000 });
+    } finally {
+      if (importCookieBtn) importCookieBtn.disabled = false;
     }
   }
-
-  async function setRefreshProfileEnabled(profileId, enabled) {
-    try {
-      const res = await fetch(`/api/v1/refresh-profiles/${encodeURIComponent(profileId)}/enabled`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: Boolean(enabled) }),
-      });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || "状态更新失败");
-      }
-      showMsg(refreshMsg, "状态更新成功", false);
-      await loadRefreshProfiles();
-    } catch (err) {
-      showMsg(refreshMsg, err.message || "状态更新失败", true);
-    }
-  }
-
-  async function deleteRefreshProfile(profileId) {
-    if (!confirm("确定要删除这个自动刷新配置吗？")) return;
-    try {
-      const res = await fetch(`/api/v1/refresh-profiles/${encodeURIComponent(profileId)}`, { method: "DELETE" });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || "删除失败");
-      }
-      showMsg(refreshMsg, "删除成功", false);
-      await loadRefreshProfiles();
-      await loadTokens();
-    } catch (err) {
-      showMsg(refreshMsg, err.message || "删除失败", true);
-    }
-  }
-
-  window.deleteRefreshProfileById = async (id) => {
-    await deleteRefreshProfile(String(id || ""));
-  };
 
   if (cookieFile) {
     cookieFile.addEventListener("change", async () => {
@@ -1206,6 +1155,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (files.length === 1) {
           const text = await files[0].text();
           if (cookieInput) cookieInput.value = text;
+          showMsg(refreshMsg, `已读取 1 个文件：${files[0].name}`, false, { duration: 5000 });
           return;
         }
 
@@ -1229,6 +1179,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (cookieInput) {
           cookieInput.value = JSON.stringify(items, null, 2);
         }
+        showMsg(refreshMsg, `已读取 ${files.length} 个文件，解析出 ${items.length} 个 Cookie`, false, { duration: 6000 });
       } catch (err) {
         showMsg(refreshMsg, "读取 Cookie 文件失败", true);
       }
@@ -1626,10 +1577,21 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
 
-  function showMsg(el, text, isError) {
+  function showMsg(el, text, isError, options = {}) {
+    if (!el) return;
+    const duration = Number(options?.duration ?? 3000);
+    if (el._msgTimer) {
+      clearTimeout(el._msgTimer);
+      el._msgTimer = null;
+    }
     el.textContent = text;
     el.style.color = isError ? "#ffb4bc" : "#4de2c4";
-    setTimeout(() => { el.textContent = ""; }, 3000);
+    if (duration > 0) {
+      el._msgTimer = setTimeout(() => {
+        el.textContent = "";
+        el._msgTimer = null;
+      }, duration);
+    }
   }
 
   let toastTimer = null;
@@ -1655,5 +1617,4 @@ document.addEventListener("DOMContentLoaded", async () => {
   loadTokens();
   loadConfig();
   renderLogsPagination();
-  loadRefreshProfiles();
 });

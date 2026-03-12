@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, List
@@ -35,6 +36,28 @@ def build_admin_router(
     get_generated_storage_stats: Callable[[], dict[str, Any]],
 ) -> APIRouter:
     router = APIRouter()
+
+    def get_batch_concurrency() -> int:
+        try:
+            value = int(config_manager.get("batch_concurrency", 5) or 5)
+        except Exception:
+            value = 5
+        return max(1, min(100, value))
+
+    def delete_token_and_linked_profile(token_id: str) -> bool:
+        token_info = token_manager.get_by_id(token_id)
+        if not token_info:
+            return False
+
+        profile_id = str(token_info.get("refresh_profile_id") or "").strip()
+        if token_info.get("auto_refresh") and profile_id:
+            try:
+                refresh_manager.remove_profile(profile_id)
+            except KeyError:
+                token_manager.remove(token_id)
+        else:
+            token_manager.remove(token_id)
+        return True
 
     @router.get("/api/v1/health")
     def health():
@@ -218,10 +241,40 @@ def build_admin_router(
             "tokens": exported,
         }
 
+    @router.post("/api/v1/tokens/delete-batch")
+    def delete_tokens_batch(req: ExportSelectionRequest, request: Request):
+        require_admin_auth(request)
+        token_ids = req.ids if isinstance(req.ids, list) else None
+        normalized_ids = [
+            str(x or "").strip() for x in (token_ids or []) if str(x or "").strip()
+        ]
+        if not normalized_ids:
+            raise HTTPException(status_code=400, detail="ids is required")
+
+        deleted = []
+        missing = []
+        for tid in normalized_ids:
+            if delete_token_and_linked_profile(tid):
+                deleted.append(tid)
+            else:
+                missing.append(tid)
+
+        if not deleted:
+            raise HTTPException(status_code=404, detail="no token deleted")
+
+        return {
+            "status": "ok" if not missing else "partial",
+            "deleted_count": len(deleted),
+            "missing_count": len(missing),
+            "deleted_ids": deleted,
+            "missing_ids": missing,
+        }
+
     @router.delete("/api/v1/tokens/{tid}")
     def delete_token(tid: str, request: Request):
         require_admin_auth(request)
-        token_manager.remove(tid)
+        if not delete_token_and_linked_profile(tid):
+            raise HTTPException(status_code=404, detail="token not found")
         return {"status": "ok"}
 
     @router.put("/api/v1/tokens/{tid}/status")
@@ -315,12 +368,28 @@ def build_admin_router(
 
         refreshed = []
         failed = []
-        for tid in token_ids:
+        max_workers = min(get_batch_concurrency(), len(token_ids))
+
+        def refresh_one(index: int, tid: str):
             try:
-                refreshed.append(refresh_manager.refresh_credits_for_token_id(tid))
+                return index, "ok", refresh_manager.refresh_credits_for_token_id(tid)
             except Exception as exc:
                 token_manager.set_credits_error(tid, str(exc))
-                failed.append({"token_id": tid, "detail": str(exc)})
+                return index, "failed", {"token_id": tid, "detail": str(exc)}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(refresh_one, index, tid)
+                for index, tid in enumerate(token_ids)
+            ]
+            done_items = [future.result() for future in as_completed(futures)]
+
+        done_items.sort(key=lambda item: item[0])
+        for _, status, payload in done_items:
+            if status == "ok":
+                refreshed.append(payload)
+            else:
+                failed.append(payload)
 
         return {
             "status": "ok" if not failed else "partial",
@@ -465,6 +534,20 @@ def build_admin_router(
                     detail="token_rotation_strategy must be one of: round_robin, random",
                 )
             update_data["token_rotation_strategy"] = strategy
+        if "batch_concurrency" in incoming:
+            try:
+                batch_concurrency = int(incoming["batch_concurrency"])
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="batch_concurrency must be an integer between 1 and 100",
+                )
+            if batch_concurrency < 1 or batch_concurrency > 100:
+                raise HTTPException(
+                    status_code=400,
+                    detail="batch_concurrency must be between 1 and 100",
+                )
+            update_data["batch_concurrency"] = batch_concurrency
         if "generated_max_size_mb" in incoming:
             try:
                 generated_max_size_mb = int(incoming["generated_max_size_mb"])
@@ -524,12 +607,25 @@ def build_admin_router(
     @router.post("/api/v1/refresh-profiles/export-cookies")
     def refresh_profiles_export_cookies(req: ExportSelectionRequest, request: Request):
         require_admin_auth(request)
-        profile_ids = req.ids if isinstance(req.ids, list) else None
+        token_ids = req.ids if isinstance(req.ids, list) else None
+        profile_ids = None
+        if token_ids:
+            profile_ids = []
+            seen = set()
+            for tid in token_ids:
+                token_info = token_manager.get_by_id(str(tid or "").strip())
+                if not token_info:
+                    continue
+                profile_id = str(token_info.get("refresh_profile_id") or "").strip()
+                if not profile_id or profile_id in seen:
+                    continue
+                seen.add(profile_id)
+                profile_ids.append(profile_id)
         exported = refresh_manager.export_cookies(profile_ids)
         return {
             "status": "ok",
             "total": len(exported),
-            "selected": bool(profile_ids),
+            "selected": bool(token_ids),
             "items": exported,
         }
 
@@ -569,39 +665,69 @@ def build_admin_router(
         failed = []
         refreshed = []
         refresh_failed = []
-        for idx, item in enumerate(req.items):
+
+        def import_one(idx: int, item):
             try:
                 profile = refresh_manager.import_cookie(item.cookie, name=item.name)
-                imported.append(profile)
-                try:
-                    refresh_result = refresh_manager.refresh_once(
-                        str(profile.get("id") or "")
-                    )
-                    refreshed.append(
-                        {
-                            "index": idx,
-                            "profile_id": profile.get("id"),
-                            "profile_name": profile.get("name"),
-                            "result": refresh_result,
-                        }
-                    )
-                except Exception as exc:
-                    refresh_failed.append(
-                        {
-                            "index": idx,
-                            "profile_id": profile.get("id"),
-                            "profile_name": profile.get("name"),
-                            "detail": str(exc),
-                        }
-                    )
             except ValueError as exc:
-                failed.append(
-                    {
+                return {
+                    "index": idx,
+                    "imported": None,
+                    "failed": {
                         "index": idx,
                         "name": item.name,
                         "detail": str(exc),
-                    }
+                    },
+                    "refreshed": None,
+                    "refresh_failed": None,
+                }
+
+            refreshed_item = None
+            refresh_failed_item = None
+            try:
+                refresh_result = refresh_manager.refresh_once(
+                    str(profile.get("id") or "")
                 )
+                refreshed_item = {
+                    "index": idx,
+                    "profile_id": profile.get("id"),
+                    "profile_name": profile.get("name"),
+                    "result": refresh_result,
+                }
+            except Exception as exc:
+                refresh_failed_item = {
+                    "index": idx,
+                    "profile_id": profile.get("id"),
+                    "profile_name": profile.get("name"),
+                    "detail": str(exc),
+                }
+
+            return {
+                "index": idx,
+                "imported": profile,
+                "failed": None,
+                "refreshed": refreshed_item,
+                "refresh_failed": refresh_failed_item,
+            }
+
+        max_workers = min(get_batch_concurrency(), len(req.items))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(import_one, idx, item)
+                for idx, item in enumerate(req.items)
+            ]
+            done_items = [future.result() for future in as_completed(futures)]
+
+        done_items.sort(key=lambda item: item["index"])
+        for item in done_items:
+            if item["imported"] is not None:
+                imported.append(item["imported"])
+            if item["failed"] is not None:
+                failed.append(item["failed"])
+            if item["refreshed"] is not None:
+                refreshed.append(item["refreshed"])
+            if item["refresh_failed"] is not None:
+                refresh_failed.append(item["refresh_failed"])
 
         result = {
             "status": (
