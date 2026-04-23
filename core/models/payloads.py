@@ -42,45 +42,39 @@ def build_image_payload_candidates(
     upstream_model_version: str,
     source_image_ids: Optional[list[str]] = None,
 ) -> list[dict]:
+    normalized_ratio = str(aspect_ratio or "").strip().lower()
+    effective_ratio = normalized_ratio or "1:1"
     base_payload = {
         "modelId": upstream_model_id,
         "modelVersion": upstream_model_version,
         "n": 1,
         "prompt": prompt,
-        "size": size_from_ratio(aspect_ratio, output_resolution),
+        "size": size_from_ratio(effective_ratio, output_resolution),
         "seeds": [int(time.time()) % 999999],
         "groundSearch": False,
         "skipCai": False,
         "output": {"storeInputs": True},
-        "generationMetadata": {"module": "text2image"},
+        "generationMetadata": {
+            "module": "text2image",
+            "submodule": "ff-image-generate",
+        },
         "modelSpecificPayload": {
-            "aspectRatio": aspect_ratio,
             "parameters": {"addWatermark": False},
         },
     }
+    if normalized_ratio and normalized_ratio != "auto":
+        base_payload["modelSpecificPayload"]["aspectRatio"] = normalized_ratio
 
     if not source_image_ids:
         base_payload["referenceBlobs"] = []
         return [base_payload]
 
-    candidates: list[dict] = []
     edited = dict(base_payload)
-    edited["generationMetadata"] = {"module": "image2image"}
-
-    c1 = dict(edited)
-    c1["referenceBlobs"] = [
+    edited["generationMetadata"] = {
+        "module": "image2image",
+        "submodule": "ff-image-generate",
+    }
+    edited["referenceBlobs"] = [
         {"id": img_id, "usage": "general"} for img_id in source_image_ids
     ]
-    candidates.append(c1)
-
-    c4 = dict(edited)
-    c4["referenceBlobs"] = []
-    c4["imagePrompt"] = {"referenceImage": source_image_ids[0]}
-    candidates.append(c4)
-
-    c5 = dict(edited)
-    c5["referenceBlobs"] = []
-    c5["imagePrompt"] = {"referenceImage": {"id": source_image_ids[0]}}
-    candidates.append(c5)
-
-    return candidates
+    return [edited]

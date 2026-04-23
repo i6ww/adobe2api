@@ -606,7 +606,11 @@ class AdobeClient:
             job_id = path_parts[-1]
             if not job_id:
                 return raw_url
-            return f"https://bks-epo8522.adobe.io/v2/jobs/result/{job_id}?host={host}/"
+            host_suffix = host[len("firefly-epo") :].split(".", 1)[0]
+            shard = host_suffix[:4].strip()
+            if len(shard) != 4 or not shard.isdigit():
+                return raw_url
+            return f"https://bks-epo{shard}.adobe.io/v2/jobs/result/{job_id}?host={host}/"
         except Exception:
             return raw_url
 
@@ -619,6 +623,23 @@ class AdobeClient:
                 return path_parts[-1]
         except Exception:
             pass
+        return ""
+
+    @staticmethod
+    def _extract_result_link(submit_resp, submit_data: Any) -> str:
+        poll_url = str(submit_resp.headers.get("x-override-status-link") or "").strip()
+        if poll_url:
+            return poll_url
+
+        links = submit_data.get("links") if isinstance(submit_data, dict) else {}
+        if not isinstance(links, dict):
+            links = {}
+
+        result_link = links.get("result")
+        if isinstance(result_link, str):
+            return result_link.strip()
+        if isinstance(result_link, dict):
+            return str(result_link.get("href") or "").strip()
         return ""
 
     @staticmethod
@@ -792,9 +813,7 @@ class AdobeClient:
             )
 
         submit_data = submit_resp.json()
-        poll_url = submit_resp.headers.get("x-override-status-link") or (
-            (submit_data.get("links") or {}).get("result") or {}
-        ).get("href")
+        poll_url = self._extract_result_link(submit_resp, submit_data)
         if not poll_url:
             raise AdobeRequestError("video submit succeeded but no poll url returned")
         poll_url = self._normalize_video_poll_url(str(poll_url))
@@ -993,9 +1012,7 @@ class AdobeClient:
             )
 
         submit_data = submit_resp.json()
-        poll_url = submit_resp.headers.get("x-override-status-link") or (
-            (submit_data.get("links") or {}).get("result") or {}
-        ).get("href")
+        poll_url = self._extract_result_link(submit_resp, submit_data)
         if not poll_url:
             raise AdobeRequestError("submit succeeded but no poll url returned")
 
