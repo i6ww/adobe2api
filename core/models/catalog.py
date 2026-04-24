@@ -1,12 +1,46 @@
 from __future__ import annotations
 
-SUPPORTED_RATIOS = {"1:1", "16:9", "9:16", "4:3", "3:4"}
+SUPPORTED_RATIOS = {
+    "1:1",
+    "1:8",
+    "1:4",
+    "5:4",
+    "9:16",
+    "21:9",
+    "4:1",
+    "16:9",
+    "4:3",
+    "3:2",
+    "4:5",
+    "3:4",
+    "8:1",
+    "2:3",
+}
 RATIO_SUFFIX_MAP = {
     "1:1": "1x1",
     "16:9": "16x9",
     "9:16": "9x16",
     "4:3": "4x3",
     "3:4": "3x4",
+}
+NANO_BANANA2_RATIO_SUFFIX_MAP = {
+    **RATIO_SUFFIX_MAP,
+    "1:8": "1x8",
+    "1:4": "1x4",
+    "4:1": "4x1",
+    "8:1": "8x1",
+}
+GPT_IMAGE_RATIO_SUFFIX_MAP = {
+    "1:1": "1x1",
+    "5:4": "5x4",
+    "9:16": "9x16",
+    "21:9": "21x9",
+    "16:9": "16x9",
+    "3:2": "3x2",
+    "4:3": "4x3",
+    "4:5": "4x5",
+    "3:4": "3x4",
+    "2:3": "2x3",
 }
 
 MODEL_CATALOG: dict[str, dict] = {}
@@ -18,9 +52,10 @@ def _register_nano_banana_family(
     upstream_model_id: str,
     upstream_model_version: str,
     family_label: str,
+    ratio_suffix_map: dict[str, str] = RATIO_SUFFIX_MAP,
 ) -> None:
     for res in ("1k", "2k", "4k"):
-        for ratio, suffix in RATIO_SUFFIX_MAP.items():
+        for ratio, suffix in ratio_suffix_map.items():
             model_id = f"{prefix}-{res}-{suffix}"
             MODEL_CATALOG[model_id] = {
                 "upstream_model": "google:firefly:colligo:nano-banana-pro",
@@ -29,6 +64,20 @@ def _register_nano_banana_family(
                 "output_resolution": res.upper(),
                 "aspect_ratio": ratio,
                 "description": f"{family_label} ({res.upper()} {ratio})",
+            }
+
+
+def _register_gpt_image_family() -> None:
+    for res in ("1k", "2k", "4k"):
+        for ratio, suffix in GPT_IMAGE_RATIO_SUFFIX_MAP.items():
+            model_id = f"firefly-gpt-image-{res}-{suffix}"
+            MODEL_CATALOG[model_id] = {
+                "upstream_model": "openai:firefly:gpt-image",
+                "upstream_model_id": "gpt-image",
+                "upstream_model_version": "2",
+                "output_resolution": res.upper(),
+                "aspect_ratio": ratio,
+                "description": f"Firefly GPT Image ({res.upper()} {ratio})",
             }
 
 
@@ -49,7 +98,9 @@ _register_nano_banana_family(
     upstream_model_id="gemini-flash",
     upstream_model_version="nano-banana-3",
     family_label="Firefly Nano Banana 2",
+    ratio_suffix_map=NANO_BANANA2_RATIO_SUFFIX_MAP,
 )
+_register_gpt_image_family()
 
 DEFAULT_MODEL_ID = "firefly-nano-banana-pro-2k-16x9"
 

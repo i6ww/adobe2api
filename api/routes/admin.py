@@ -576,6 +576,14 @@ def build_admin_router(
                     detail="generated_prune_size_mb must be between 10 and 10240",
                 )
             update_data["generated_prune_size_mb"] = generated_prune_size_mb
+        if "gpt_image_quality" in incoming:
+            gpt_image_quality = str(incoming["gpt_image_quality"] or "").strip().lower()
+            if gpt_image_quality not in {"low", "medium", "high"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="gpt_image_quality must be one of: low, medium, high",
+                )
+            update_data["gpt_image_quality"] = gpt_image_quality
         effective_max = int(
             update_data.get(
                 "generated_max_size_mb",

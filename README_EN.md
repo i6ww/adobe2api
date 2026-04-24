@@ -71,6 +71,7 @@ Current supported model families are:
 - `firefly-nano-banana-*` (image, maps to upstream `nano-banana-2`)
 - `firefly-nano-banana2-*` (image, maps to upstream `nano-banana-3`)
 - `firefly-nano-banana-pro-*` (image)
+- `firefly-gpt-image-*` (image, maps to upstream `gpt-image:2`)
 - `firefly-sora2-*` (video)
 - `firefly-sora2-pro-*` (video)
 - `firefly-veo31-*` (video)
@@ -90,19 +91,35 @@ Nano Banana 2 image models (`nano-banana-3`):
 
 - Pattern: `firefly-nano-banana2-{resolution}-{ratio}`
 - Resolution: `1k` / `2k` / `4k`
-- Ratio suffix: `1x1` / `16x9` / `9x16` / `4x3` / `3x4`
+- Ratio suffix: `1x1` / `16x9` / `9x16` / `4x3` / `3x4` / `1x8` / `1x4` / `4x1` / `8x1`
+- Nano Banana 2 additionally supports ultra-wide/tall ratios: `1:8` / `1:4` / `4:1` / `8:1`
 - Examples:
   - `firefly-nano-banana2-2k-16x9`
   - `firefly-nano-banana2-4k-1x1`
+  - `firefly-nano-banana2-2k-1x8`
+  - `firefly-nano-banana2-2k-8x1`
 
 Nano Banana Pro image models (legacy-compatible):
 
 - Pattern: `firefly-nano-banana-pro-{resolution}-{ratio}`
 - Resolution: `1k` / `2k` / `4k`
 - Ratio suffix: `1x1` / `16x9` / `9x16` / `4x3` / `3x4`
+- Does not include Nano Banana 2's extra `1:8` / `1:4` / `4:1` / `8:1` ratios
 - Examples:
   - `firefly-nano-banana-pro-2k-16x9`
   - `firefly-nano-banana-pro-4k-1x1`
+
+GPT Image models (experimental):
+
+- Pattern: `firefly-gpt-image-{quality}-{ratio}`
+- Quality: `low` / `medium` / `high`
+- Ratio suffix: `auto` / `3x2` / `1x1` / `2x3`
+- Based on live capture, `GPT Image 2` uses `modelSpecificPayload.size` and `generationSettings.detailLevel`
+- The implementation no longer treats quality as resolution. No separate resolution field has been observed in the request payload.
+- Examples:
+  - `firefly-gpt-image-medium-auto`
+  - `firefly-gpt-image-medium-3x2`
+  - `firefly-gpt-image-high-1x1`
 
 Sora2 video models:
 
