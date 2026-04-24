@@ -83,6 +83,7 @@ Nano Banana 图像模型（`nano-banana-2`）：
 - 命名：`firefly-nano-banana-{resolution}-{ratio}`
 - 分辨率：`1k` / `2k` / `4k`
 - 比例后缀：`1x1` / `16x9` / `9x16` / `4x3` / `3x4`
+- 当前实现支持 `1K` / `2K` / `4K`
 - 示例：
   - `firefly-nano-banana-2k-16x9`
   - `firefly-nano-banana-4k-1x1`
@@ -93,6 +94,7 @@ Nano Banana 2 图像模型（`nano-banana-3`）：
 - 分辨率：`1k` / `2k` / `4k`
 - 比例后缀：`1x1` / `16x9` / `9x16` / `4x3` / `3x4` / `1x8` / `1x4` / `4x1` / `8x1`
 - Nano Banana 2 额外支持超长比例：`1:8` / `1:4` / `4:1` / `8:1`
+- 当前实现支持 `1K` / `2K` / `4K`
 - 示例：
   - `firefly-nano-banana2-2k-16x9`
   - `firefly-nano-banana2-4k-1x1`
@@ -105,21 +107,28 @@ Nano Banana Pro 图像模型（兼容旧命名）：
 - 分辨率：`1k` / `2k` / `4k`
 - 比例后缀：`1x1` / `16x9` / `9x16` / `4x3` / `3x4`
 - 不包含 Nano Banana 2 的超长比例 `1:8` / `1:4` / `4:1` / `8:1`
+- 当前实现支持 `1K` / `2K` / `4K`
 - 示例：
   - `firefly-nano-banana-pro-2k-16x9`
   - `firefly-nano-banana-pro-4k-1x1`
 
 GPT Image 图像模型（实验接入）：
 
-- 命名：`firefly-gpt-image-{quality}-{ratio}`
-- 画质：`low` / `medium` / `high`
-- 比例后缀：`auto` / `3x2` / `1x1` / `2x3`
-- 参考官网抓包：`GPT Image 2` 的真实请求使用 `modelSpecificPayload.size` 和 `generationSettings.detailLevel`
-- 当前实现不再把画质当成分辨率。请求里未发现独立分辨率字段。
+- 命名：`firefly-gpt-image-{resolution}-{ratio}`
+- 分辨率：`1k` / `2k` / `4k`
+- 比例后缀：`1x1` / `5x4` / `9x16` / `21x9` / `16x9` / `4x3` / `3x2` / `4x5` / `3x4` / `2x3`
+- 当前实现会携带 `outputResolution` 和对应像素 `size`
+- GPT Image 质量由系统配置 `gpt_image_quality` 控制：`low` / `medium` / `high`，默认 `low`
 - 示例：
-  - `firefly-gpt-image-medium-auto`
-  - `firefly-gpt-image-medium-3x2`
-  - `firefly-gpt-image-high-1x1`
+  - `firefly-gpt-image-2k-16x9`
+  - `firefly-gpt-image-4k-1x1`
+  - `firefly-gpt-image-2k-21x9`
+
+关于 `auto`：
+
+- 当前实现 **不支持** `aspect_ratio=auto`
+- 如果请求里传入 `auto`，服务端会回退为 `1:1`
+- 请显式传具体比例，或直接使用带比例后缀的模型 ID
 
 Sora2 视频模型：
 
