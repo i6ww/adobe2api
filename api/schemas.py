@@ -44,6 +44,7 @@ class ConfigUpdateRequest(BaseModel):
     batch_concurrency: Optional[int] = None
     generated_max_size_mb: Optional[int] = None
     generated_prune_size_mb: Optional[int] = None
+    gpt_image_quality: Optional[str] = None
 
 
 class RefreshCookieImportRequest(BaseModel):

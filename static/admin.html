@@ -137,6 +137,16 @@
               <input type="number" id="confGenerateTimeout" class="input-text" step="1" placeholder="默认 300" />
               <p class="help">默认 300 秒。支持任意正整数，按你的业务场景设置。</p>
             </div>
+
+            <div class="form-group">
+              <label for="confGptImageQuality">GPT Image 默认质量</label>
+              <select id="confGptImageQuality" class="input-select">
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+              </select>
+              <p class="help">仅作用于 GPT Image 模型。默认 low，后续 GPT 生图会自动带上该质量对应的参数。</p>
+            </div>
           </section>
 
           <section id="cfg-retry" class="config-cat-pane">

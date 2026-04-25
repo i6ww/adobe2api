@@ -135,6 +135,12 @@ def build_generation_router(
                     upstream_model_version=str(
                         model_conf.get("upstream_model_version") or "nano-banana-2"
                     ),
+                    quality_level=(
+                        client.gpt_image_quality
+                        if str(model_conf.get("upstream_model_id") or "") == "gpt-image"
+                        else None
+                    ),
+                    detail_level=model_conf.get("detail_level"),
                     timeout=client.generate_timeout,
                     out_path=out_path,
                     progress_cb=_image_progress_cb,
@@ -340,6 +346,12 @@ def build_generation_router(
                         upstream_model_version=str(
                             model_conf.get("upstream_model_version") or "nano-banana-2"
                         ),
+                        quality_level=(
+                            client.gpt_image_quality
+                            if str(model_conf.get("upstream_model_id") or "") == "gpt-image"
+                            else None
+                        ),
+                        detail_level=model_conf.get("detail_level"),
                         out_path=out_path,
                     )
                     if image_bytes is not None:
@@ -588,6 +600,13 @@ def build_generation_router(
                             image_model_conf.get("upstream_model_version")
                             or "nano-banana-2"
                         ),
+                        quality_level=(
+                            client.gpt_image_quality
+                            if str(image_model_conf.get("upstream_model_id") or "")
+                            == "gpt-image"
+                            else None
+                        ),
+                        detail_level=image_model_conf.get("detail_level"),
                         source_image_ids=source_image_ids,
                         timeout=client.generate_timeout,
                         out_path=out_path,

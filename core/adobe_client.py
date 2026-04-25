@@ -101,6 +101,7 @@ class AdobeClient:
         self.retry_on_status_codes = [429, 451, 500, 502, 503, 504]
         self.retry_on_error_types = {"timeout", "connection", "proxy"}
         self.token_rotation_strategy = "round_robin"
+        self.gpt_image_quality = "low"
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         self.sec_ch_ua = (
             '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
@@ -144,6 +145,10 @@ class AdobeClient:
         self.generate_timeout = timeout_val if timeout_val > 0 else 300
         self.proxy = proxy if use_proxy and proxy else ""
         self.retry_enabled = bool(cfg.get("retry_enabled", True))
+        gpt_quality = str(cfg.get("gpt_image_quality", "low") or "low").strip().lower()
+        if gpt_quality not in {"low", "medium", "high"}:
+            gpt_quality = "low"
+        self.gpt_image_quality = gpt_quality
         try:
             attempts = int(cfg.get("retry_max_attempts", 3))
         except Exception:
@@ -524,6 +529,8 @@ class AdobeClient:
         output_resolution: str,
         upstream_model_id: str,
         upstream_model_version: str,
+        quality_level: Optional[str] = None,
+        detail_level: Optional[int] = None,
         source_image_ids: Optional[list[str]] = None,
     ) -> list[dict]:
         return build_image_payload_candidates(
@@ -532,6 +539,8 @@ class AdobeClient:
             output_resolution=output_resolution,
             upstream_model_id=upstream_model_id,
             upstream_model_version=upstream_model_version,
+            quality_level=quality_level,
+            detail_level=detail_level,
             source_image_ids=source_image_ids,
         )
 
@@ -996,6 +1005,8 @@ class AdobeClient:
         output_resolution: str = "2K",
         upstream_model_id: str = "gemini-flash",
         upstream_model_version: str = "nano-banana-2",
+        quality_level: Optional[str] = None,
+        detail_level: Optional[int] = None,
         source_image_ids: Optional[list[str]] = None,
         timeout: int = 180,
         out_path: Optional[Path] = None,
@@ -1009,6 +1020,8 @@ class AdobeClient:
             output_resolution=output_resolution,
             upstream_model_id=upstream_model_id,
             upstream_model_version=upstream_model_version,
+            quality_level=quality_level,
+            detail_level=detail_level,
             source_image_ids=source_image_ids,
         ):
             submit_resp = self._post_json(

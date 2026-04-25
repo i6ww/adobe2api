@@ -659,6 +659,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const confUseProxy = document.getElementById("confUseProxy");
   const confProxy = document.getElementById("confProxy");
   const confGenerateTimeout = document.getElementById("confGenerateTimeout");
+  const confGptImageQuality = document.getElementById("confGptImageQuality");
   const confRetryEnabled = document.getElementById("confRetryEnabled");
   const confRetryMaxAttempts = document.getElementById("confRetryMaxAttempts");
   const confRetryBackoffSeconds = document.getElementById("confRetryBackoffSeconds");
@@ -743,6 +744,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         confUseProxy.checked = data.use_proxy || false;
         confProxy.value = data.proxy || "";
         confGenerateTimeout.value = Number(data.generate_timeout || 300);
+        confGptImageQuality.value = String(data.gpt_image_quality || "low");
         confRetryEnabled.checked = Boolean(data.retry_enabled ?? true);
         confRetryMaxAttempts.value = Number(data.retry_max_attempts || 3);
         confRetryBackoffSeconds.value = Number(data.retry_backoff_seconds ?? 1.0);
@@ -785,6 +787,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         use_proxy: confUseProxy.checked,
         proxy: confProxy.value.trim(),
         generate_timeout: Math.max(1, Number(confGenerateTimeout.value || 300)),
+        gpt_image_quality: String(confGptImageQuality.value || "low").trim().toLowerCase() || "low",
         retry_enabled: confRetryEnabled.checked,
         retry_max_attempts: Math.max(1, Math.min(10, Number(confRetryMaxAttempts.value || 3))),
         retry_backoff_seconds: Math.max(0, Math.min(30, Number(confRetryBackoffSeconds.value || 1))),
@@ -812,6 +815,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       if (!Number.isInteger(payload.refresh_interval_hours) || payload.refresh_interval_hours < 1 || payload.refresh_interval_hours > 24) {
         throw new Error("自动刷新间隔必须是 1-24 的整数小时");
+      }
+      if (!["low", "medium", "high"].includes(payload.gpt_image_quality)) {
+        throw new Error("GPT Image 默认质量必须是 low、medium 或 high");
       }
       if (!Number.isInteger(payload.batch_concurrency) || payload.batch_concurrency < 1 || payload.batch_concurrency > 100) {
         throw new Error("批量导入/积分并发数必须是 1-100 的整数");
