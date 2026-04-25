@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import os
 import re
@@ -79,12 +81,41 @@ def build_payload_candidates(prompt: str):
     ]
 
 
+def decode_jwt_payload(token: str) -> dict:
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1].strip()
+    if not payload:
+        return {}
+    payload += "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def build_submit_nonce(token: str, prompt: str) -> str:
+    claims = decode_jwt_payload(token)
+    user_id = str(
+        claims.get("user_id") or claims.get("aa_id") or claims.get("sub") or ""
+    ).strip()
+    prompt_prefix = str(prompt or "")[:256]
+    if not user_id or not prompt_prefix:
+        return ""
+    raw = f"{user_id}-{prompt_prefix}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def submit_job(token: str, api_key: str, prompt: str):
     url = "https://firefly-3p.ff.adobe.io/v2/3p-images/generate-async"
     headers = {
         "Authorization": f"Bearer {token}",
         "x-api-key": api_key,
         "content-type": "application/json",
+        "x-nonce": build_submit_nonce(token, prompt),
     }
 
     last_error = None

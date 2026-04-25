@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -18,6 +20,45 @@ except Exception:
 
 
 logger = logging.getLogger("adobe2api")
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    raw_token = str(token or "").strip()
+    if not raw_token:
+        return {}
+    parts = raw_token.split(".")
+    if len(parts) < 2:
+        return {}
+
+    payload_part = parts[1].strip()
+    if not payload_part:
+        return {}
+
+    padding = (-len(payload_part)) % 4
+    if padding:
+        payload_part += "=" * padding
+
+    try:
+        decoded = base64.urlsafe_b64decode(payload_part.encode("ascii"))
+        payload = json.loads(decoded.decode("utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_submit_nonce(token: str, prompt: str) -> str:
+    claims = _decode_jwt_payload(token)
+    user_id = str(
+        claims.get("user_id")
+        or claims.get("aa_id")
+        or claims.get("sub")
+        or ""
+    ).strip()
+    prompt_prefix = str(prompt or "")[:256]
+    if not user_id or not prompt_prefix:
+        return ""
+    nonce_input = f"{user_id}-{prompt_prefix}".encode("utf-8")
+    return hashlib.sha256(nonce_input).hexdigest()
 
 
 class AdobeRequestError(Exception):
@@ -229,7 +270,7 @@ class AdobeClient:
             "sec-fetch-dest": "empty",
         }
 
-    def _submit_headers(self, token: str) -> dict:
+    def _submit_headers(self, token: str, prompt: str = "") -> dict:
         headers = self._browser_headers()
         headers.update(
             {
@@ -239,6 +280,9 @@ class AdobeClient:
                 "accept": "*/*",
             }
         )
+        submit_nonce = _build_submit_nonce(token, prompt)
+        if submit_nonce:
+            headers["x-nonce"] = submit_nonce
         return headers
 
     def _submit_headers_minimal(self, token: str) -> dict:
@@ -792,7 +836,9 @@ class AdobeClient:
             reference_mode=reference_mode,
         )
         submit_resp = self._post_json(
-            self.video_submit_url, headers=self._submit_headers(token), payload=payload
+            self.video_submit_url,
+            headers=self._submit_headers(token, prompt=prompt),
+            payload=payload,
         )
 
         if submit_resp.status_code in (401, 403):
@@ -966,7 +1012,9 @@ class AdobeClient:
             source_image_ids=source_image_ids,
         ):
             submit_resp = self._post_json(
-                self.submit_url, headers=self._submit_headers(token), payload=payload
+                self.submit_url,
+                headers=self._submit_headers(token, prompt=prompt),
+                payload=payload,
             )
             if submit_resp.status_code == 200:
                 break
